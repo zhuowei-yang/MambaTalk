@@ -160,10 +160,12 @@ The code is based on [EMAGE](https://github.com/PantoMatrix/PantoMatrix). We tha
 If MambaTalk is useful for your research, please consider citing:
 
 ```angular2html
-@inproceedings{xu2024mambatalk,
+@article{xu2024mambatalk,
   title={Mambatalk: Efficient holistic gesture synthesis with selective state space models},
   author={Xu, Zunnan and Lin, Yukang and Han, Haonan and Yang, Sicheng and Li, Ronghui and Zhang, Yachao and Li, Xiu},
-  booktitle={The Thirty-eighth Annual Conference on Neural Information Processing Systems},
+  journal={Advances in Neural Information Processing Systems},
+  volume={37},
+  pages={20055--20080},
   year={2024}
 }
 ```
