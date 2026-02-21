@@ -25,12 +25,16 @@ class Quantizer(nn.Module):
         assert z.shape[-1] == self.e_dim
         z_flattened = z.contiguous().view(-1, self.e_dim)
 
+        if torch.isnan(z_flattened).any() or torch.isinf(z_flattened).any():
+            z_flattened = torch.nan_to_num(z_flattened, nan=0.0, posinf=1e6, neginf=-1e6)
+
         # B x V
         d = torch.sum(z_flattened ** 2, dim=1, keepdim=True) + \
             torch.sum(self.embedding.weight**2, dim=1) - 2 * \
             torch.matmul(z_flattened, self.embedding.weight.t())
         # B x 1
         min_encoding_indices = torch.argmin(d, dim=1)
+        min_encoding_indices = min_encoding_indices.clamp(0, self.n_e - 1)
         z_q = self.embedding(min_encoding_indices).view(z.shape)
 
         # compute loss for embedding
@@ -54,9 +58,11 @@ class Quantizer(nn.Module):
         :return z_q:
         """
         assert z.shape[-1] == self.e_dim
-        #print(z.shape)
         z_flattened = z.contiguous().view(-1, self.e_dim)
-        #print(z_flattened.shape)
+
+        # Replace NaN/Inf to prevent undefined argmin behavior
+        if torch.isnan(z_flattened).any() or torch.isinf(z_flattened).any():
+            z_flattened = torch.nan_to_num(z_flattened, nan=0.0, posinf=1e6, neginf=-1e6)
 
         # B x V
         d = torch.sum(z_flattened ** 2, dim=1, keepdim=True) + \
@@ -64,6 +70,7 @@ class Quantizer(nn.Module):
             torch.matmul(z_flattened, self.embedding.weight.t())
         # B x 1
         min_encoding_indices = torch.argmin(d, dim=1)
+        min_encoding_indices = min_encoding_indices.clamp(0, self.n_e - 1)
         return min_encoding_indices.reshape(z.shape[0], -1)
 
     def get_codebook_entry(self, indices):
@@ -72,7 +79,7 @@ class Quantizer(nn.Module):
         :param indices(B, seq_len):
         :return z_q(B, seq_len, e_dim):
         """
-        index_flattened = indices.view(-1)
+        index_flattened = indices.view(-1).clamp(0, self.n_e - 1)
         z_q = self.embedding(index_flattened)
         z_q = z_q.view(indices.shape + (self.e_dim, )).contiguous()
         return z_q

@@ -17,12 +17,43 @@ import torch.distributed as dist
 from transformers import Wav2Vec2ForCTC, Wav2Vec2Processor
 import pyarrow
 import librosa
-import smplx
 
 from .build_vocab import Vocab
 from .data_tools import joints_list
 from .utils import rotation_conversions as rc
 from .utils import other_tools
+
+
+def load_mhr_native(npz_path):
+    """
+    Load MHR native parameters from SAM-3D-Body npz.
+    
+    Returns dict with:
+        body_pose: (N, 130) body joint Euler angles (hand indices zeroed, excludes jaw)
+        jaw: (N, 3) jaw Euler angles (body_pose_params[130:133])
+        hand_pose: (N, 108) hand PCA 6D coefficients
+        expr: (N, 72) FLAME expression PCA coefficients
+        global_rot: (N, 3) global rotation Euler ZYX
+        cam_t: (N, 3) camera translation
+        shape: (N, 45) or (45,) shape parameters
+        joints: (N, 127, 3) joint 3D coordinates
+        fps: float
+    """
+    data = np.load(npz_path, allow_pickle=True)
+    body_pose = data['body_pose_params'][:, :130].astype(np.float32)
+    jaw = data['body_pose_params'][:, 130:133].astype(np.float32)
+    hand_pose = data['hand_pose_params'].astype(np.float32)
+    expr = data['expr_params'].astype(np.float32)
+    global_rot = data['global_rot'].astype(np.float32)
+    cam_t = data['pred_cam_t'].astype(np.float32)
+    shape = data['shape_params'].astype(np.float32)
+    joints = data['pred_joint_coords'].astype(np.float32) if 'pred_joint_coords' in data.files else None
+    fps = float(data['fps'][0]) if 'fps' in data.files else 30.0
+    return {
+        'body_pose': body_pose, 'jaw': jaw, 'hand_pose': hand_pose,
+        'expr': expr, 'global_rot': global_rot, 'cam_t': cam_t,
+        'shape': shape, 'joints': joints, 'fps': fps,
+    }
 
 class CustomDataset(Dataset):
     def __init__(self, args, loader_type, augmentation=None, kwargs=None, build_cache=True):
@@ -32,49 +63,31 @@ class CustomDataset(Dataset):
         self.rank = dist.get_rank()
         self.ori_stride = self.args.stride
         self.ori_length = self.args.pose_length
-        self.alignment = [0,0] # for trinity
-        
-        self.ori_joint_list = joints_list[self.args.ori_joints]
-        self.tar_joint_list = joints_list[self.args.tar_joints]
+        self.alignment = [0,0]
         
         self.processor = Wav2Vec2Processor.from_pretrained("facebook/wav2vec2-base-960h")
         self.model = Wav2Vec2ForCTC.from_pretrained("facebook/wav2vec2-base-960h")            
 
-        if 'smplx' in self.args.pose_rep:
-            self.joint_mask = np.zeros(len(list(self.ori_joint_list.keys()))*3)
-            self.joints = len(list(self.tar_joint_list.keys()))  
-            for joint_name in self.tar_joint_list:
-                self.joint_mask[self.ori_joint_list[joint_name][1] - self.ori_joint_list[joint_name][0]:self.ori_joint_list[joint_name][1]] = 1
-        else:
-            self.joints = len(list(self.ori_joint_list.keys()))+1
-            self.joint_mask = np.zeros(self.joints*3)
-            for joint_name in self.tar_joint_list:
-                if joint_name == "Hips":
-                    self.joint_mask[3:6] = 1
-                else:
-                    self.joint_mask[self.ori_joint_list[joint_name][1] - self.ori_joint_list[joint_name][0]:self.ori_joint_list[joint_name][1]] = 1
-        # select trainable joints
-        self.smplx = smplx.create(
-            self.args.data_path_1+"smplx_models/", 
-            model_type='smplx',
-            gender='NEUTRAL_2020', 
-            use_face_contour=False,
-            num_betas=300,
-            num_expression_coeffs=100, 
-            ext='npz',
-            use_pca=False,
-        ).cuda().eval()
+        # MHR native: pose = body(130) + hand(108) + face(75) + global(10) = 323 total
+        # Cached as single concatenated vector per frame
+        # face = expr(72) + jaw(3) = 75
+        # global = global_rot(3) + cam_t(3) + contact(4) = 10
+        self.joints = 55  # kept for compatibility with eval metrics
+        self.mhr_body_dim = 130
+        self.mhr_hand_dim = 108
+        self.mhr_face_dim = 75   # expr(72) + jaw(3)
+        self.mhr_global_dim = 10  # global_rot(3) + cam_t(3) + contact(4)
+        self.mhr_total_dim = self.mhr_body_dim + self.mhr_hand_dim + self.mhr_face_dim + self.mhr_global_dim
 
         split_rule = pd.read_csv(args.data_path+"train_test_split.csv")
-        self.selected_file = split_rule.loc[(split_rule['type'] == loader_type) & (split_rule['id'].str.split("_").str[0].astype(int).isin(self.args.training_speakers))]
+        # Select files by type only (speaker filtering disabled for MHR data)
+        self.selected_file = split_rule.loc[split_rule['type'] == loader_type]
         if args.additional_data and loader_type == 'train':
-            split_b = split_rule.loc[(split_rule['type'] == 'additional') & (split_rule['id'].str.split("_").str[0].astype(int).isin(self.args.training_speakers))]
-            #self.selected_file = split_rule.loc[(split_rule['type'] == 'additional') & (split_rule['id'].str.split("_").str[0].astype(int).isin(self.args.training_speakers))]
+            split_b = split_rule.loc[split_rule['type'] == 'additional']
             self.selected_file = pd.concat([self.selected_file, split_b])
         if self.selected_file.empty:
-            logger.warning(f"{loader_type} is empty for speaker {self.args.training_speakers}, use train set 0-8 instead")
-            self.selected_file = split_rule.loc[(split_rule['type'] == 'train') & (split_rule['id'].str.split("_").str[0].astype(int).isin(self.args.training_speakers))]
-            self.selected_file = self.selected_file.iloc[0:8]
+            logger.warning(f"{loader_type} is empty, use train set 0-8 instead")
+            self.selected_file = split_rule.loc[split_rule['type'] == 'train'].iloc[0:8]
         self.data_dir = args.data_path 
         
         if loader_type == "test": 
@@ -118,85 +131,26 @@ class CustomDataset(Dataset):
 
     
     def calculate_mean_velocity(self, save_path):
-        self.smplx = smplx.create(
-            self.args.data_path_1+"smplx_models/", 
-            model_type='smplx',
-            gender='NEUTRAL_2020', 
-            use_face_contour=False,
-            num_betas=300,
-            num_expression_coeffs=100, 
-            ext='npz',
-            use_pca=False,
-        ).cuda().eval()
         dir_p = self.data_dir + self.args.pose_rep + "/"
         all_list = []
         from tqdm import tqdm
         for tar in tqdm(os.listdir(dir_p)):
             if tar.endswith(".npz"):
-                m_data = np.load(dir_p+tar, allow_pickle=True)
-                betas, poses, trans, exps = m_data["betas"], m_data["poses"], m_data["trans"], m_data["expressions"]
-                n, c = poses.shape[0], poses.shape[1]
-                betas = betas.reshape(1, 300)
-                betas = np.tile(betas, (n, 1))
-                betas = torch.from_numpy(betas).cuda().float()
-                poses = torch.from_numpy(poses.reshape(n, c)).cuda().float()
-                exps = torch.from_numpy(exps.reshape(n, 100)).cuda().float()
-                trans = torch.from_numpy(trans.reshape(n, 3)).cuda().float()
-                max_length = 128
-                s, r = n//max_length, n%max_length
-                #print(n, s, r)
-                all_tensor = []
-                for i in range(s):
-                    with torch.no_grad():
-                        joints = self.smplx(
-                            betas=betas[i*max_length:(i+1)*max_length], 
-                            transl=trans[i*max_length:(i+1)*max_length], 
-                            expression=exps[i*max_length:(i+1)*max_length], 
-                            jaw_pose=poses[i*max_length:(i+1)*max_length, 66:69], 
-                            global_orient=poses[i*max_length:(i+1)*max_length,:3], 
-                            body_pose=poses[i*max_length:(i+1)*max_length,3:21*3+3], 
-                            left_hand_pose=poses[i*max_length:(i+1)*max_length,25*3:40*3], 
-                            right_hand_pose=poses[i*max_length:(i+1)*max_length,40*3:55*3], 
-                            return_verts=True,
-                            return_joints=True,
-                            leye_pose=poses[i*max_length:(i+1)*max_length, 69:72], 
-                            reye_pose=poses[i*max_length:(i+1)*max_length, 72:75],
-                        )['joints'][:, :55, :].reshape(max_length, 55*3)
-                    all_tensor.append(joints)
-                if r != 0:
-                    with torch.no_grad():
-                        joints = self.smplx(
-                            betas=betas[s*max_length:s*max_length+r], 
-                            transl=trans[s*max_length:s*max_length+r], 
-                            expression=exps[s*max_length:s*max_length+r], 
-                            jaw_pose=poses[s*max_length:s*max_length+r, 66:69], 
-                            global_orient=poses[s*max_length:s*max_length+r,:3], 
-                            body_pose=poses[s*max_length:s*max_length+r,3:21*3+3], 
-                            left_hand_pose=poses[s*max_length:s*max_length+r,25*3:40*3], 
-                            right_hand_pose=poses[s*max_length:s*max_length+r,40*3:55*3], 
-                            return_verts=True,
-                            return_joints=True,
-                            leye_pose=poses[s*max_length:s*max_length+r, 69:72], 
-                            reye_pose=poses[s*max_length:s*max_length+r, 72:75],
-                        )['joints'][:, :55, :].reshape(r, 55*3)
-                    all_tensor.append(joints)
-                joints = torch.cat(all_tensor, axis=0)
-                joints = joints.permute(1, 0)
+                mhr = load_mhr_native(dir_p + tar)
+                joints_np = mhr['joints']
+                if joints_np is None:
+                    continue
+                joints_np = joints_np[:, :55, :]  # (N, 55, 3)
+                n = joints_np.shape[0]
+                joints = torch.from_numpy(joints_np).float().reshape(n, 55*3).permute(1, 0)
                 dt = 1/30
-            # first steps is forward diff (t+1 - t) / dt
                 init_vel = (joints[:, 1:2] - joints[:, :1]) / dt
-                # middle steps are second order (t+1 - t-1) / 2dt
                 middle_vel = (joints[:, 2:] - joints[:, 0:-2]) / (2 * dt)
-                # last step is backward diff (t - t-1) / dt
                 final_vel = (joints[:, -1:] - joints[:, -2:-1]) / dt
-                #print(joints.shape, init_vel.shape, middle_vel.shape, final_vel.shape)
                 vel_seq = torch.cat([init_vel, middle_vel, final_vel], dim=1).permute(1, 0).reshape(n, 55, 3)
-                #print(vel_seq.shape)
-                #.permute(1, 0).reshape(n, 55, 3)
-                vel_seq_np = vel_seq.cpu().numpy()
-                vel_joints_np = np.linalg.norm(vel_seq_np, axis=2) # n * 55
+                vel_joints_np = np.linalg.norm(vel_seq.numpy(), axis=2)
                 all_list.append(vel_joints_np)
-        avg_vel = np.mean(np.concatenate(all_list, axis=0),axis=0) # 55
+        avg_vel = np.mean(np.concatenate(all_list, axis=0), axis=0)
         np.save(save_path, avg_vel)
         
     
@@ -257,82 +211,51 @@ class CustomDataset(Dataset):
             
             logger.info(colored(f"# ---- Building cache for Pose   {id_pose} ---- #", "blue"))
             if "smplx" in self.args.pose_rep:
-                pose_data = np.load(pose_file, allow_pickle=True)
-                assert 30%self.args.pose_fps == 0, 'pose_fps should be an aliquot part of 30'
-                stride = int(30/self.args.pose_fps)
-                pose_each_file = pose_data["poses"][::stride] 
-                trans_each_file = pose_data["trans"][::stride]
-                shape_each_file = np.repeat(pose_data["betas"].reshape(1, 300), pose_each_file.shape[0], axis=0)
+                # ============ MHR Native Parameter Loading ============
+                mhr = load_mhr_native(pose_file)
                 
-                assert self.args.pose_fps == 30, "should 30"
-                m_data = np.load(pose_file, allow_pickle=True)
-                betas, poses, trans, exps = m_data["betas"], m_data["poses"], m_data["trans"], m_data["expressions"]
-                n, c = poses.shape[0], poses.shape[1]
-                betas = betas.reshape(1, 300)
-                betas = np.tile(betas, (n, 1))
-                betas = torch.from_numpy(betas).cuda().float()
-                poses = torch.from_numpy(poses.reshape(n, c)).cuda().float()
-                exps = torch.from_numpy(exps.reshape(n, 100)).cuda().float()
-                trans = torch.from_numpy(trans.reshape(n, 3)).cuda().float()
-                max_length = 128
-                s, r = n//max_length, n%max_length
-                #print(n, s, r)
-                all_tensor = []
-                for i in range(s):
-                    with torch.no_grad():
-                        joints = self.smplx(
-                            betas=betas[i*max_length:(i+1)*max_length], 
-                            transl=trans[i*max_length:(i+1)*max_length], 
-                            expression=exps[i*max_length:(i+1)*max_length], 
-                            jaw_pose=poses[i*max_length:(i+1)*max_length, 66:69], 
-                            global_orient=poses[i*max_length:(i+1)*max_length,:3], 
-                            body_pose=poses[i*max_length:(i+1)*max_length,3:21*3+3], 
-                            left_hand_pose=poses[i*max_length:(i+1)*max_length,25*3:40*3], 
-                            right_hand_pose=poses[i*max_length:(i+1)*max_length,40*3:55*3], 
-                            return_verts=True,
-                            return_joints=True,
-                            leye_pose=poses[i*max_length:(i+1)*max_length, 69:72], 
-                            reye_pose=poses[i*max_length:(i+1)*max_length, 72:75],
-                        )['joints'][:, (7,8,10,11), :].reshape(max_length, 4, 3).cpu()
-                    all_tensor.append(joints)
-                if r != 0:
-                    with torch.no_grad():
-                        joints = self.smplx(
-                            betas=betas[s*max_length:s*max_length+r], 
-                            transl=trans[s*max_length:s*max_length+r], 
-                            expression=exps[s*max_length:s*max_length+r], 
-                            jaw_pose=poses[s*max_length:s*max_length+r, 66:69], 
-                            global_orient=poses[s*max_length:s*max_length+r,:3], 
-                            body_pose=poses[s*max_length:s*max_length+r,3:21*3+3], 
-                            left_hand_pose=poses[s*max_length:s*max_length+r,25*3:40*3], 
-                            right_hand_pose=poses[s*max_length:s*max_length+r,40*3:55*3], 
-                            return_verts=True,
-                            return_joints=True,
-                            leye_pose=poses[s*max_length:s*max_length+r, 69:72], 
-                            reye_pose=poses[s*max_length:s*max_length+r, 72:75],
-                        )['joints'][:, (7,8,10,11), :].reshape(r, 4, 3).cpu()
-                    all_tensor.append(joints)
-                joints = torch.cat(all_tensor, axis=0) # all, 4, 3
-                # print(joints.shape)
-                feetv = torch.zeros(joints.shape[1], joints.shape[0])
-                joints = joints.permute(1, 0, 2)
-                #print(joints.shape, feetv.shape)
-                feetv[:, :-1] = (joints[:, 1:] - joints[:, :-1]).norm(dim=-1)
-                #print(feetv.shape)
-                contacts = (feetv < 0.01).numpy().astype(float)
-                # print(contacts.shape, contacts)
-                contacts = contacts.transpose(1, 0)
-                pose_each_file = pose_each_file * self.joint_mask
-                pose_each_file = pose_each_file[:, self.joint_mask.astype(bool)]
-                pose_each_file = np.concatenate([pose_each_file, contacts], axis=1)
-                # print(pose_each_file.shape)
+                assert 30 % self.args.pose_fps == 0, 'pose_fps should be an aliquot part of 30'
+                stride = int(30 / self.args.pose_fps)
                 
+                body_pose = mhr['body_pose'][::stride]   # (N, 130)
+                jaw = mhr['jaw'][::stride]                # (N, 3)
+                hand_pose = mhr['hand_pose'][::stride]    # (N, 108)
+                expr = mhr['expr'][::stride]              # (N, 72)
+                global_rot = mhr['global_rot'][::stride]  # (N, 3)
+                cam_t = mhr['cam_t'][::stride]            # (N, 3)
+                n = body_pose.shape[0]
+                
+                # Foot contact from joint coordinates
+                joints_all = mhr['joints']
+                if joints_all is not None:
+                    joints_all = joints_all[::stride]
+                    # MHR foot joints: 37=right_ankle area, 74=left_foot_inner
+                    # Use ankle-level joints for contact detection
+                    feet_idx = [13, 14, 15, 18]  # left_ankle, right_ankle, left_big_toe, right_big_toe from keypoints
+                    feet_joints = torch.from_numpy(joints_all[:, feet_idx, :]).float().permute(1, 0, 2)
+                    feetv = torch.zeros(4, n)
+                    feetv[:, :-1] = (feet_joints[:, 1:] - feet_joints[:, :-1]).norm(dim=-1)
+                    contacts = (feetv < 0.01).numpy().astype(float).T  # (N, 4)
+                else:
+                    contacts = np.zeros((n, 4), dtype=np.float32)
+                
+                # face = expr(72) + jaw(3) = 75
+                face_params = np.concatenate([expr, jaw], axis=1)  # (N, 75)
+                # global = global_rot(3) + cam_t(3) + contact(4) = 10
+                global_params = np.concatenate([global_rot, cam_t, contacts], axis=1)  # (N, 10)
+                
+                # Concatenate all MHR params: body(130) + hand(108) + face(75) + global(10) = 323
+                pose_each_file = np.concatenate([body_pose, hand_pose, face_params, global_params], axis=1).astype(np.float32)
+                
+                trans_each_file = cam_t.copy()  # (N, 3)
+                shape = mhr['shape']
+                if len(shape.shape) > 1:
+                    shape = shape[0]
+                shape_each_file = np.repeat(shape.reshape(1, -1), n, axis=0)  # (N, 45)
                 
                 if self.args.facial_rep is not None:
                     logger.info(f"# ---- Building cache for Facial {id_pose} and Pose {id_pose} ---- #")
-                    facial_each_file = pose_data["expressions"][::stride]
-                    if self.args.facial_norm: 
-                        facial_each_file = (facial_each_file - self.mean_facial) / self.std_facial
+                    facial_each_file = face_params  # (N, 75) — stored separately for facial-only access
                     
             else:
                 assert 120%self.args.pose_fps == 0, 'pose_fps should be an aliquot part of 120'
@@ -372,7 +295,10 @@ class CustomDataset(Dataset):
                         facial_each_file = (facial_each_file - self.mean_facial) / self.std_facial
                         
             if self.args.id_rep is not None:
-                int_value = self.idmapping(int(f_name.split("_")[0]))
+                try:
+                    int_value = self.idmapping(int(f_name.split("_")[0]))
+                except (ValueError, IndexError):
+                    int_value = 0  # Default speaker ID for non-BEAT data
                 vid_each_file = np.repeat(np.array(int_value).reshape(1, 1), pose_each_file.shape[0], axis=0)
       
             if self.args.audio_rep is not None:
@@ -776,12 +702,17 @@ class CustomDataset(Dataset):
             key = "{:005}".format(idx).encode("ascii")
             sample = txn.get(key)
             sample = pyarrow.deserialize(sample)
-            # import pdb; pdb.set_trace()
             tar_pose, in_audio, in_facial, in_shape, in_word, emo, sem, vid, trans = sample
-            #print(in_shape)
-            #vid = torch.from_numpy(vid).int()
-            emo = torch.from_numpy(emo).int()
-            sem = torch.from_numpy(sem).float() 
+            # pyarrow arrays are read-only; .copy() makes them writable for CUDA kernels
+            tar_pose = np.array(tar_pose, copy=True)
+            in_audio = np.array(in_audio, copy=True)
+            in_facial = np.array(in_facial, copy=True)
+            in_shape = np.array(in_shape, copy=True)
+            in_word = np.array(in_word, copy=True)
+            vid = np.array(vid, copy=True)
+            trans = np.array(trans, copy=True)
+            emo = torch.from_numpy(np.array(emo, copy=True)).int()
+            sem = torch.from_numpy(np.array(sem, copy=True)).float() 
             in_audio = torch.from_numpy(in_audio).float() 
             in_word = torch.from_numpy(in_word).float() if self.args.word_cache else torch.from_numpy(in_word).int() 
             if self.loader_type == "test":
