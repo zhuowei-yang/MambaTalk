@@ -77,6 +77,12 @@ def parse_args():
     parser.add("--ch", default=0., type=float)
     parser.add("--vel_global_weight", default=0., type=float)
     parser.add("--vel_body_weight", default=0., type=float)
+    parser.add("--vel_hands_weight", default=0., type=float)
+    parser.add("--acc_body_weight", default=0., type=float)
+    parser.add("--acc_global_weight", default=0., type=float)
+    parser.add("--acc_hands_weight", default=0., type=float)
+    parser.add("--pose_body_weight", default=0., type=float)
+    parser.add("--pose_vel_body_weight", default=0., type=float)
     
     
     # --------------- data ---------------------------- #

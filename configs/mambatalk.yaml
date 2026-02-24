@@ -8,10 +8,10 @@ data_path: ./data/
 e_path: weights/AESKConv_240_100.bin
 eval_model: motion_representation
 e_name: null
-test_ckpt: ./outputs/audio2pose/custom/0220_110224_mambatalk/last_200.bin
+test_ckpt: ./outputs/audio2pose/custom/0221_064211_mambatalk/last_90.bin
 data_path_1: ./pretrained/
 vae_test_len: 32
-vae_test_dim: 323
+vae_test_dim: 320
 vae_test_stride: 20
 vae_length: 240
 vae_codebook_size: 256
@@ -34,8 +34,9 @@ pose_norm: False
 pose_fps: 30
 rot6d: False
 pre_frames: 4
-# pose_dims = body(130) + hand(108) + face(75) + global(10) = 323
-pose_dims: 323
+# pose_dims = body(130) + hand(108) + face(75) + global(7) = 320
+# global = global_rot(3) + contact(4); cam_t is sequence-level constant
+pose_dims: 320
 pose_length: 64
 stride: 20
 test_length: 64
@@ -48,7 +49,7 @@ m_fix_pre: False
 face_dims: 75
 body_dims: 130
 hand_dims: 108
-global_dims: 10
+global_dims: 7
 
 # audio config
 audio_rep: amplitude+ctc+audio
@@ -81,7 +82,7 @@ id_rep: onehot
 speaker_f: 0
 
 # model config
-batch_size: 2
+batch_size: 64
 lr_base: 5e-4
 model: mambatalk
 g_name: MambaTalk
@@ -101,6 +102,12 @@ lh: 3
 cl: 1
 cf: 0
 cu: 1
-ch: 1
+ch: 2
 vel_global_weight: 2.0
 vel_body_weight: 0.5
+vel_hands_weight: 1.0
+acc_body_weight: 1.0
+acc_global_weight: 1.0
+acc_hands_weight: 0.5
+pose_body_weight: 1.0
+pose_vel_body_weight: 1.0

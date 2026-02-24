@@ -21,11 +21,12 @@ from optimizers.scheduler_factory import create_scheduler
 from optimizers.loss_factory import get_loss_func
 import librosa
 
-# MHR cache layout: body(130) + hand(108) + face(75) + global(10) = 323
+# MHR cache layout: body(130) + hand(108) + face(75) + global(7) = 320
+# global = global_rot(3) + contact(4); cam_t stored separately in trans field
 MHR_BODY_SLICE = (0, 130)
 MHR_HAND_SLICE = (130, 238)
 MHR_FACE_SLICE = (238, 313)
-MHR_GLOBAL_SLICE = (313, 323)
+MHR_GLOBAL_SLICE = (313, 320)
 
 class CustomTrainer(train.BaseTrainer):
     def __init__(self, args):
@@ -36,8 +37,8 @@ class CustomTrainer(train.BaseTrainer):
         self.tracker = other_tools.EpochTracker(
             ["fid", "l1div", "bc", "rec", "trans", "vel", "transv", 'dis', 'gen', 'acc',
              'transa', 'exp', 'lvd', 'mse', "cls", "rec_face", "latent",
-             "cls_full", "cls_self", "cls_word", "latent_word", "latent_self"],
-            [False, True, True] + [False]*19
+             "cls_full", "cls_self", "cls_word", "latent_word", "latent_self", "accel"],
+            [False, True, True] + [False]*20
         )
 
         # Load MHR VQ-VAE models (new dimensions)
@@ -70,6 +71,7 @@ class CustomTrainer(train.BaseTrainer):
         self.vq_model_hands.eval()
 
         self.cls_loss = nn.NLLLoss().to(self.rank)
+        self.cls_loss_smooth = nn.CrossEntropyLoss(label_smoothing=0.1).to(self.rank)
         self.reclatent_loss = nn.MSELoss().to(self.rank)
         self.vel_loss = torch.nn.L1Loss(reduction='mean').to(self.rank)
         self.log_softmax = nn.LogSoftmax(dim=2).to(self.rank)
@@ -103,11 +105,11 @@ class CustomTrainer(train.BaseTrainer):
         tar_pose_body = tar_pose_raw[:, :, MHR_BODY_SLICE[0]:MHR_BODY_SLICE[1]]    # (bs, n, 130)
         tar_pose_hands = tar_pose_raw[:, :, MHR_HAND_SLICE[0]:MHR_HAND_SLICE[1]]   # (bs, n, 108)
         tar_pose_face = tar_pose_raw[:, :, MHR_FACE_SLICE[0]:MHR_FACE_SLICE[1]]    # (bs, n, 75)
-        tar_pose_global = tar_pose_raw[:, :, MHR_GLOBAL_SLICE[0]:MHR_GLOBAL_SLICE[1]]  # (bs, n, 10)
+        tar_pose_global = tar_pose_raw[:, :, MHR_GLOBAL_SLICE[0]:MHR_GLOBAL_SLICE[1]]  # (bs, n, 7)
         
-        tar_trans = tar_pose_global[:, :, 3:6]  # cam_t
+        tar_trans = dict_data["trans"].to(self.rank)  # cam_t from data (sequence-level constant)
         tar_exps = tar_pose_face[:, :, :72]     # expr_params
-        tar_contact = tar_pose_global[:, :, 6:]  # contact(4)
+        tar_contact = tar_pose_global[:, :, 3:]  # contact(4), now at index 3 since cam_t removed
 
         # VQ-VAE encoding (frozen)
         tar_index_face = self.vq_model_face.map2index(tar_pose_face)
@@ -180,9 +182,42 @@ class CustomTrainer(train.BaseTrainer):
         tar_body_lat = loaded_data["latent_body"]
         loss_vel_body = self.vel_loss(rec_body_lat[:, 1:] - rec_body_lat[:, :-1],
                                       tar_body_lat[:, 1:] - tar_body_lat[:, :-1])
-        loss_vel = self.args.vel_global_weight * loss_vel_global + self.args.vel_body_weight * loss_vel_body
+        rec_hands_lat = net_out_val["rec_hands"]
+        tar_hands_lat = loaded_data["latent_hands"]
+        loss_vel_hands = self.vel_loss(rec_hands_lat[:, 1:] - rec_hands_lat[:, :-1],
+                                       tar_hands_lat[:, 1:] - tar_hands_lat[:, :-1])
+        loss_vel = self.args.vel_global_weight * loss_vel_global + self.args.vel_body_weight * loss_vel_body + self.args.vel_hands_weight * loss_vel_hands
         self.tracker.update_meter("vel", "train", loss_vel.item())
         g_loss_final += loss_vel
+
+        # Acceleration loss: penalize sudden velocity changes (second-order smoothness)
+        rec_acc_global = rec_global[:, 2:] - 2 * rec_global[:, 1:-1] + rec_global[:, :-2]
+        tar_acc_global = tar_global[:, 2:] - 2 * tar_global[:, 1:-1] + tar_global[:, :-2]
+        loss_acc_global = self.vel_loss(rec_acc_global, tar_acc_global)
+        rec_acc_body = rec_body_lat[:, 2:] - 2 * rec_body_lat[:, 1:-1] + rec_body_lat[:, :-2]
+        tar_acc_body = tar_body_lat[:, 2:] - 2 * tar_body_lat[:, 1:-1] + tar_body_lat[:, :-2]
+        loss_acc_body = self.vel_loss(rec_acc_body, tar_acc_body)
+        rec_acc_hands = rec_hands_lat[:, 2:] - 2 * rec_hands_lat[:, 1:-1] + rec_hands_lat[:, :-2]
+        tar_acc_hands = tar_hands_lat[:, 2:] - 2 * tar_hands_lat[:, 1:-1] + tar_hands_lat[:, :-2]
+        loss_acc_hands = self.vel_loss(rec_acc_hands, tar_acc_hands)
+        loss_acc = self.args.acc_global_weight * loss_acc_global + self.args.acc_body_weight * loss_acc_body + self.args.acc_hands_weight * loss_acc_hands
+        self.tracker.update_meter("accel", "train", loss_acc.item())
+        g_loss_final += loss_acc
+
+        # Pose-space body loss: soft codebook lookup is differentiable,
+        # decoder is detached to prevent gradient explosion through frozen conv layers
+        body_probs = F.softmax(net_out_val["cls_body"], dim=2)
+        codebook_weight = self.vq_model_body.quantizer.embedding.weight
+        soft_body_latent = torch.matmul(body_probs, codebook_weight)
+        with torch.no_grad():
+            rec_pose_body_decoded = self.vq_model_body.decoder(soft_body_latent)
+        # Soft-latent space smoothness loss (differentiable through codebook lookup)
+        tar_body_codebook = loaded_data["latent_body"]
+        loss_pose_body = self.reclatent_loss(soft_body_latent, tar_body_codebook)
+        loss_pose_vel_body = self.vel_loss(
+            soft_body_latent[:, 1:] - soft_body_latent[:, :-1],
+            tar_body_codebook[:, 1:] - tar_body_codebook[:, :-1])
+        g_loss_final += self.args.pose_body_weight * loss_pose_body + self.args.pose_vel_body_weight * loss_pose_vel_body
 
         rec_index_face_val = self.log_softmax(net_out_val["cls_face"]).reshape(-1, self.args.vae_codebook_size)
         rec_index_body_val = self.log_softmax(net_out_val["cls_body"]).reshape(-1, self.args.vae_codebook_size)
@@ -190,8 +225,9 @@ class CustomTrainer(train.BaseTrainer):
         tar_index_face = loaded_data["tar_index_face"].reshape(-1)
         tar_index_body = loaded_data["tar_index_body"].reshape(-1)
         tar_index_hands = loaded_data["tar_index_hands"].reshape(-1)
+        # Body uses label-smoothed CrossEntropyLoss to reduce codebook oscillation
         loss_cls = self.args.cf*self.cls_loss(rec_index_face_val, tar_index_face)\
-            + self.args.cu*self.cls_loss(rec_index_body_val, tar_index_body)\
+            + self.args.cu*self.cls_loss_smooth(net_out_val["cls_body"].reshape(-1, self.args.vae_codebook_size), tar_index_body)\
             + self.args.ch*self.cls_loss(rec_index_hands_val, tar_index_hands)
         self.tracker.update_meter("cls_full", "train", loss_cls.item())
         g_loss_final += loss_cls
@@ -213,9 +249,10 @@ class CustomTrainer(train.BaseTrainer):
             self.tracker.update_meter("latent_self", "train", loss_latent_self.item())
             g_loss_final += loss_latent_self
             rec_index_face_self = self.log_softmax(net_out_self["cls_face"]).reshape(-1, self.args.vae_codebook_size)
-            rec_index_body_self = self.log_softmax(net_out_self["cls_body"]).reshape(-1, self.args.vae_codebook_size)
             rec_index_hands_self = self.log_softmax(net_out_self["cls_hands"]).reshape(-1, self.args.vae_codebook_size)
-            index_loss_top_self = self.cls_loss(rec_index_face_self, tar_index_face) + self.cls_loss(rec_index_body_self, tar_index_body) + self.cls_loss(rec_index_hands_self, tar_index_hands)
+            index_loss_top_self = self.cls_loss(rec_index_face_self, tar_index_face) \
+                + self.cls_loss_smooth(net_out_self["cls_body"].reshape(-1, self.args.vae_codebook_size), tar_index_body) \
+                + self.cls_loss(rec_index_hands_self, tar_index_hands)
             self.tracker.update_meter("cls_self", "train", index_loss_top_self.item())
             g_loss_final += index_loss_top_self
             
@@ -233,9 +270,10 @@ class CustomTrainer(train.BaseTrainer):
             g_loss_final += loss_latent_word
 
             rec_index_face_word = self.log_softmax(net_out_word["cls_face"]).reshape(-1, self.args.vae_codebook_size)
-            rec_index_body_word = self.log_softmax(net_out_word["cls_body"]).reshape(-1, self.args.vae_codebook_size)
             rec_index_hands_word = self.log_softmax(net_out_word["cls_hands"]).reshape(-1, self.args.vae_codebook_size)
-            index_loss_top_word = self.cls_loss(rec_index_face_word, tar_index_face) + self.cls_loss(rec_index_body_word, tar_index_body) + self.cls_loss(rec_index_hands_word, tar_index_hands)
+            index_loss_top_word = self.cls_loss(rec_index_face_word, tar_index_face) \
+                + self.cls_loss_smooth(net_out_word["cls_body"].reshape(-1, self.args.vae_codebook_size), tar_index_body) \
+                + self.cls_loss(rec_index_hands_word, tar_index_hands)
             self.tracker.update_meter("cls_word", "train", index_loss_top_word.item())
             g_loss_final += index_loss_top_word
 
@@ -385,7 +423,7 @@ class CustomTrainer(train.BaseTrainer):
         n = rec_pose.shape[1]
 
         rec_exps = rec_face[:, :, :72]  # expr_params
-        rec_trans = rec_global[:, :, 3:6]  # cam_t
+        rec_trans = tar_trans[:, :n, :]  # cam_t from original data (not predicted)
         tar_pose = tar_pose[:, :n, :]
         tar_exps = tar_exps[:, :n, :]
         tar_trans = tar_trans[:, :n, :]
@@ -508,12 +546,16 @@ class CustomTrainer(train.BaseTrainer):
                     focal_length=np.array([focal_length]), width=np.array([orig_width]),
                     height=np.array([orig_height]), mocap_frame_rate=30)
                 
+                # cam_t: sequence-level constant from original data
+                cam_t_seq = net_out['tar_trans'].detach().cpu().numpy().reshape(bs*n, -1)
+                cam_t_mean = cam_t_seq.mean(axis=0, keepdims=True).repeat(bs*n, axis=0)
+                
                 np.savez(results_save_path+"gt_"+test_seq_list.iloc[its]['id']+'.npz',
                     body_pose_params=np.concatenate([tar_np[:, MHR_BODY_SLICE[0]:MHR_BODY_SLICE[1]], tar_np[:, MHR_FACE_SLICE[0]+72:MHR_FACE_SLICE[1]]], axis=1),
                     hand_pose_params=tar_np[:, MHR_HAND_SLICE[0]:MHR_HAND_SLICE[1]],
                     expr_params=tar_np[:, MHR_FACE_SLICE[0]:MHR_FACE_SLICE[0]+72],
                     global_rot=tar_np[:, MHR_GLOBAL_SLICE[0]:MHR_GLOBAL_SLICE[0]+3],
-                    pred_cam_t=tar_np[:, MHR_GLOBAL_SLICE[0]+3:MHR_GLOBAL_SLICE[0]+6],
+                    pred_cam_t=cam_t_seq,
                     **render_consts,
                 )
                 np.savez(results_save_path+"res_"+test_seq_list.iloc[its]['id']+'.npz',
@@ -521,7 +563,7 @@ class CustomTrainer(train.BaseTrainer):
                     hand_pose_params=rec_np[:, MHR_HAND_SLICE[0]:MHR_HAND_SLICE[1]],
                     expr_params=rec_np[:, MHR_FACE_SLICE[0]:MHR_FACE_SLICE[0]+72],
                     global_rot=rec_np[:, MHR_GLOBAL_SLICE[0]:MHR_GLOBAL_SLICE[0]+3],
-                    pred_cam_t=rec_np[:, MHR_GLOBAL_SLICE[0]+3:MHR_GLOBAL_SLICE[0]+6],
+                    pred_cam_t=cam_t_mean,
                     **render_consts,
                 )
                 total_length += n
@@ -563,12 +605,15 @@ class CustomTrainer(train.BaseTrainer):
                 orig_width = int(gt_npz['width'][0]) if 'width' in gt_npz.files else 1080
                 orig_height = int(gt_npz['height'][0]) if 'height' in gt_npz.files else 1920
                 
+                cam_t_demo = net_out['tar_trans'].detach().cpu().numpy().reshape(bs*n, -1)
+                cam_t_demo_mean = cam_t_demo.mean(axis=0, keepdims=True).repeat(bs*n, axis=0)
+                
                 np.savez(results_save_path+"res_"+test_seq_list.iloc[its]['id']+'.npz',
                     body_pose_params=np.concatenate([rec_np[:, MHR_BODY_SLICE[0]:MHR_BODY_SLICE[1]], rec_np[:, MHR_FACE_SLICE[0]+72:MHR_FACE_SLICE[1]]], axis=1),
                     hand_pose_params=rec_np[:, MHR_HAND_SLICE[0]:MHR_HAND_SLICE[1]],
                     expr_params=rec_np[:, MHR_FACE_SLICE[0]:MHR_FACE_SLICE[0]+72],
                     global_rot=rec_np[:, MHR_GLOBAL_SLICE[0]:MHR_GLOBAL_SLICE[0]+3],
-                    pred_cam_t=rec_np[:, MHR_GLOBAL_SLICE[0]+3:MHR_GLOBAL_SLICE[0]+6],
+                    pred_cam_t=cam_t_demo_mean,
                     shape_params=shape, scale_params=scale_params,
                     focal_length=np.array([focal_length]),
                     width=np.array([orig_width]), height=np.array([orig_height]),

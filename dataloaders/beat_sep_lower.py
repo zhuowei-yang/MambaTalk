@@ -68,15 +68,15 @@ class CustomDataset(Dataset):
         self.processor = Wav2Vec2Processor.from_pretrained("facebook/wav2vec2-base-960h")
         self.model = Wav2Vec2ForCTC.from_pretrained("facebook/wav2vec2-base-960h")            
 
-        # MHR native: pose = body(130) + hand(108) + face(75) + global(10) = 323 total
+        # MHR native: pose = body(130) + hand(108) + face(75) + global(7) = 320 total
         # Cached as single concatenated vector per frame
         # face = expr(72) + jaw(3) = 75
-        # global = global_rot(3) + cam_t(3) + contact(4) = 10
+        # global = global_rot(3) + contact(4) = 7  (cam_t stored separately in trans field)
         self.joints = 55  # kept for compatibility with eval metrics
         self.mhr_body_dim = 130
         self.mhr_hand_dim = 108
         self.mhr_face_dim = 75   # expr(72) + jaw(3)
-        self.mhr_global_dim = 10  # global_rot(3) + cam_t(3) + contact(4)
+        self.mhr_global_dim = 7   # global_rot(3) + contact(4); cam_t in trans field
         self.mhr_total_dim = self.mhr_body_dim + self.mhr_hand_dim + self.mhr_face_dim + self.mhr_global_dim
 
         split_rule = pd.read_csv(args.data_path+"train_test_split.csv")
@@ -241,10 +241,10 @@ class CustomDataset(Dataset):
                 
                 # face = expr(72) + jaw(3) = 75
                 face_params = np.concatenate([expr, jaw], axis=1)  # (N, 75)
-                # global = global_rot(3) + cam_t(3) + contact(4) = 10
-                global_params = np.concatenate([global_rot, cam_t, contacts], axis=1)  # (N, 10)
+                # global = global_rot(3) + contact(4) = 7  (cam_t stored separately in trans)
+                global_params = np.concatenate([global_rot, contacts], axis=1)  # (N, 7)
                 
-                # Concatenate all MHR params: body(130) + hand(108) + face(75) + global(10) = 323
+                # Concatenate all MHR params: body(130) + hand(108) + face(75) + global(7) = 320
                 pose_each_file = np.concatenate([body_pose, hand_pose, face_params, global_params], axis=1).astype(np.float32)
                 
                 trans_each_file = cam_t.copy()  # (N, 3)
