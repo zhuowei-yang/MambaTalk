@@ -821,7 +821,7 @@ def save_checkpoints(save_path, model, opt=None, epoch=None, lrs=None):
     torch.save(states, save_path)
 
 def load_checkpoints(model, save_path, load_name='model'):
-    states = torch.load(save_path)
+    states = torch.load(save_path, map_location='cpu')
     new_weights = OrderedDict()
     flag = False
     for k, v in states['model_state'].items():

@@ -15,9 +15,8 @@ class GlobalScan(nn.Module):
         args_top = copy.deepcopy(self.args)
         args_top.vae_layer = 3
         args_top.vae_length = args.motion_f
-        args_top.vae_test_dim = args.pose_dims+3+4 
-        # learnable query      
-        self.learnable_query = nn.Parameter(torch.zeros(1, 1, self.args.pose_dims+3+4))
+        args_top.vae_test_dim = args.pose_dims
+        self.learnable_query = nn.Parameter(torch.zeros(1, 1, self.args.pose_dims))
         self.motion_encoder = VQEncoderV6(args_top)
         self.motion_proj1 = MLP(args.motion_f, args.hidden_size, args.motion_f)
         self.motion_proj2 = nn.Linear(args.motion_f, args.hidden_size)
@@ -63,78 +62,74 @@ class LocalScan(nn.Module):
         # cross-attention
         self.position_embeddings = PeriodicPositionalEncoding(args.hidden_size, period=args.pose_length, max_seq_len=args.pose_length)
         self.motion_cross_attn = nn.TransformerDecoder(nn.TransformerDecoderLayer(d_model=args.hidden_size, nhead=4, dim_feedforward=args.hidden_size, batch_first=True), num_layers=8)
-        self.motion2latent_upper = MLP(args.hidden_size, args.hidden_size, args.hidden_size)
+        self.motion2latent_body = MLP(args.hidden_size, args.hidden_size, args.hidden_size)
         self.motion2latent_hands = MLP(args.hidden_size, args.hidden_size, args.hidden_size)
-        self.motion2latent_lower = MLP(args.hidden_size, args.hidden_size, args.hidden_size)
+        self.motion2latent_global = MLP(args.hidden_size, args.hidden_size, args.hidden_size)
         self.face_proj = nn.Linear(2*args.hidden_size, args.hidden_size)
-        self.upper_proj = nn.Linear(2*args.hidden_size, args.hidden_size)
+        self.body_scan_proj = nn.Linear(2*args.hidden_size, args.hidden_size)
         self.hands_proj = nn.Linear(2*args.hidden_size, args.hidden_size)
-        self.lower_proj = nn.Linear(2*args.hidden_size, args.hidden_size)
-        self.body_proj = nn.Linear(args.audio_f, args.hidden_size)
+        self.global_proj = nn.Linear(2*args.hidden_size, args.hidden_size)
+        self.body_audio_proj = nn.Linear(args.audio_f, args.hidden_size)
 
         # scan
         self.face_scan = MambaScan(in_dim=args.hidden_size, d_intermediate=args.hidden_size, out_dim=args.hidden_size, n_layer=4)
-        self.upper_scan = MambaModel(d_model=args.hidden_size, n_layer=1, d_intermediate=args.hidden_size)
+        self.body_scan = MambaModel(d_model=args.hidden_size, n_layer=1, d_intermediate=args.hidden_size)
         self.hands_scan = MambaModel(d_model=args.hidden_size, n_layer=1, d_intermediate=args.hidden_size)
-        self.lower_scan = MambaModel(d_model=args.hidden_size, n_layer=1, d_intermediate=args.hidden_size)
+        self.global_scan = MambaModel(d_model=args.hidden_size, n_layer=1, d_intermediate=args.hidden_size)
 
         # decoder
         self.motion_down_face = nn.Linear(args.hidden_size, args.vae_codebook_size)
-        self.motion_down_upper = nn.Linear(args.hidden_size, args.vae_codebook_size)
+        self.motion_down_body = nn.Linear(args.hidden_size, args.vae_codebook_size)
         self.motion_down_hands = nn.Linear(args.hidden_size, args.vae_codebook_size)
-        self.motion_down_lower = nn.Linear(args.hidden_size, args.vae_codebook_size)
+        self.motion_down_global = nn.Linear(args.hidden_size, args.global_dims)  # raw 10d output
         self.face_classifier = MLP(args.vae_codebook_size, args.hidden_size, args.vae_codebook_size)
-        self.upper_classifier = MLP(args.vae_codebook_size, args.hidden_size, args.vae_codebook_size)
+        self.body_classifier = MLP(args.vae_codebook_size, args.hidden_size, args.vae_codebook_size)
         self.hands_classifier = MLP(args.vae_codebook_size, args.hidden_size, args.vae_codebook_size)
-        self.lower_classifier = MLP(args.vae_codebook_size, args.hidden_size, args.vae_codebook_size)
 
     def forward(self, global_motions, global_features, face_latent_in, speaker_embedding_body, body_features, use_word):
         # cross attn
         motion_refined_embeddings_in = global_motions + speaker_embedding_body
         motion_refined_embeddings_in = self.position_embeddings(global_motions)        
-        learnable_querys = self.motion_cross_attn(tgt=motion_refined_embeddings_in, memory=self.body_proj(body_features))
+        learnable_querys = self.motion_cross_attn(tgt=motion_refined_embeddings_in, memory=self.body_audio_proj(body_features))
         global_motions = global_motions + learnable_querys
         
         # feedforward
-        upper_latent = self.motion2latent_upper(global_motions)
+        body_latent = self.motion2latent_body(global_motions)
         hands_latent = self.motion2latent_hands(global_motions)
-        lower_latent = self.motion2latent_lower(global_motions)
+        global_latent = self.motion2latent_global(global_motions)
         
-        upper_latent_in = upper_latent + speaker_embedding_body
+        body_latent_in = body_latent + speaker_embedding_body
         hands_latent_in = hands_latent + speaker_embedding_body
-        lower_latent_in = lower_latent + speaker_embedding_body        
+        global_latent_in = global_latent + speaker_embedding_body
         
-        upper_latent_in = self.position_embeddings(upper_latent_in)
+        body_latent_in = self.position_embeddings(body_latent_in)
         hands_latent_in = self.position_embeddings(hands_latent_in)
-        lower_latent_in = self.position_embeddings(lower_latent_in)
+        global_latent_in = self.position_embeddings(global_latent_in)
         face_latent_in = self.position_embeddings(face_latent_in)        
         
         # local scan
         decoded_face = self.face_scan(self.face_proj(torch.cat([face_latent_in, global_features], dim=-1)))          
-        motion_upper = self.upper_scan(self.upper_proj(torch.cat([upper_latent_in, hands_latent+lower_latent], dim=-1)))
-        motion_hands = self.hands_scan(self.hands_proj(torch.cat([hands_latent_in, upper_latent+lower_latent], dim=-1)))
-        motion_lower = self.lower_scan(self.lower_proj(torch.cat([lower_latent_in, upper_latent+hands_latent], dim=-1)))
+        motion_body = self.body_scan(self.body_scan_proj(torch.cat([body_latent_in, hands_latent+global_latent], dim=-1)))
+        motion_hands = self.hands_scan(self.hands_proj(torch.cat([hands_latent_in, body_latent+global_latent], dim=-1)))
+        motion_global = self.global_scan(self.global_proj(torch.cat([global_latent_in, body_latent+hands_latent], dim=-1)))
         
         # codebook
         face_latent = self.motion_down_face(decoded_face)
-        upper_latent = self.motion_down_upper(motion_upper+upper_latent)
+        body_latent = self.motion_down_body(motion_body+body_latent)
         hands_latent = self.motion_down_hands(motion_hands+hands_latent)
-        lower_latent = self.motion_down_lower(motion_lower+lower_latent)
+        global_latent = self.motion_down_global(motion_global+global_latent)
 
-        # index loss
         cls_face = self.face_classifier(face_latent)
-        cls_lower = self.lower_classifier(lower_latent)
-        cls_upper = self.upper_classifier(upper_latent)
+        cls_body = self.body_classifier(body_latent)
         cls_hands = self.hands_classifier(hands_latent)
 
         return {
             "rec_face": face_latent,
-            "rec_upper": upper_latent,
-            "rec_lower": lower_latent,
+            "rec_body": body_latent,
             "rec_hands": hands_latent,
+            "rec_global": global_latent,  # raw 10d, no codebook
             "cls_face": cls_face,
-            "cls_upper": cls_upper,
-            "cls_lower": cls_lower,
+            "cls_body": cls_body,
             "cls_hands": cls_hands,
         }
 
@@ -188,7 +183,7 @@ class MambaTalk(nn.Module):
         alpha_at_face = torch.cat([in_word_face, in_audio_face], dim=-1).reshape(bs, t, c*2)
         alpha_at_face = self.at_attn_face(alpha_at_face).reshape(bs, t, c, 2)
         alpha_at_face = alpha_at_face.softmax(dim=-1)
-        fusion_face = in_word_face * alpha_at_face[:,:,:,1] + in_audio_face * alpha_at_face[:,:,:,0]        
+        fusion_face = in_word_face * alpha_at_face[:,:,:,1] + in_audio_face * alpha_at_face[:,:,:,0]
         alpha_at_body = torch.cat([in_word_body, in_audio_body], dim=-1).reshape(bs, t, c*2)
         alpha_at_body = self.at_attn_body(alpha_at_body).reshape(bs, t, c, 2)
         alpha_at_body = alpha_at_body.softmax(dim=-1)

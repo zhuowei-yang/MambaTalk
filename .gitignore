@@ -3,16 +3,15 @@ BEAT2
 datasets
 pretrained
 data/
+data-one/
+custom_data/
 data_new/
-data
-data_new
 outputs/
+.cursor/
 ckp/
 checkpoints/
-*.ckp
-*.ckpt
-*.pth
-*.pt
+data
+data_new
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
@@ -21,6 +20,11 @@ __pycache__/
 
 # C extensions
 *.so
+*.pth
+*.pt
+*.ckpt
+*.ckp
+*.zip
 
 # Distribution / packaging
 .Python
