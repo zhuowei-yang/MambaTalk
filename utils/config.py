@@ -81,6 +81,8 @@ def parse_args():
     parser.add("--acc_body_weight", default=0., type=float)
     parser.add("--acc_global_weight", default=0., type=float)
     parser.add("--acc_hands_weight", default=0., type=float)
+    parser.add("--pose_body_weight", default=0., type=float)
+    parser.add("--pose_vel_body_weight", default=0., type=float)
     
     
     # --------------- data ---------------------------- #
@@ -145,12 +147,14 @@ def parse_args():
     parser.add("--audio_dims", default=1, type=int)
     parser.add("--facial_dims", default=39, type=int)
     parser.add("--pose_dims", default=123, type=int)
+    parser.add("--face_dims", default=75, type=int)
+    parser.add("--body_dims", default=130, type=int)
+    parser.add("--hand_dims", default=108, type=int)
+    parser.add("--global_dims", default=10, type=int)
     parser.add("--word_index_num", default=5793, type=int)
     parser.add("--word_dims", default=300, type=int)
     parser.add("--speaker_dims", default=4, type=int)
     parser.add("--emotion_dims", default=8, type=int)
-    parser.add("--hand_dims", default=108, type=int)
-    parser.add("--global_dims", default=13, type=int)
     
     parser.add("--audio_norm", default=False, type=str2bool)
     parser.add("--facial_norm", default=False, type=str2bool)

@@ -15,7 +15,6 @@ import numpy as np
 import time
 import pprint
 from loguru import logger
-import smplx
 from torch.utils.tensorboard import SummaryWriter
 import wandb
 import matplotlib.pyplot as plt
@@ -106,43 +105,31 @@ class BaseTrainer(object):
         #     self.opt_d_s = create_scheduler(args, self.opt_d)
            
         if args.e_name is not None:
-            """
-            bugs on DDP training using eval_model, using additional eval_copy for evaluation 
-            """
             eval_model_module = __import__(f"models.{args.eval_model}", fromlist=["something"])
-            # eval copy is for single card evaluation
-            if self.args.ddp:
-                self.eval_model = getattr(eval_model_module, args.e_name)(args).to(self.rank)
-                self.eval_copy = getattr(eval_model_module, args.e_name)(args).to(self.rank) 
-            else:
-                self.eval_model = getattr(eval_model_module, args.e_name)(args)
-                self.eval_copy = getattr(eval_model_module, args.e_name)(args).to(self.rank)
-                
-            #if self.rank == 0:
-            other_tools.load_checkpoints(self.eval_copy, args.data_path+args.e_path, args.e_name)
-            other_tools.load_checkpoints(self.eval_model, args.data_path+args.e_path, args.e_name)
-            if self.args.ddp:
-                self.eval_model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(self.eval_model, process_group)   
-                self.eval_model = DDP(self.eval_model, device_ids=[self.rank], output_device=self.rank,
-                                      broadcast_buffers=False, find_unused_parameters=False)
-            self.eval_model.eval()
-            self.eval_copy.eval()
-            if self.rank == 0:
-                logger.info(self.eval_model)
-                logger.info(f"init {args.e_name} success")  
-                if args.stat == "wandb":
-                    wandb.watch(self.eval_model) 
-        self.smplx = smplx.create(
-        self.args.data_path_1+"smplx_models/", 
-            model_type='smplx',
-            gender='NEUTRAL_2020', 
-            use_face_contour=False,
-            num_betas=300,
-            num_expression_coeffs=100, 
-            ext='npz',
-            use_pca=False,
-        ).to(self.rank).eval()
-        self.alignmenter = metric.alignment(0.3, 7, self.train_data.avg_vel, upper_body=[3,6,9,12,13,14,15,16,17,18,19,20,21]) if self.rank == 0 else None
+            try:
+                if self.args.ddp:
+                    self.eval_model = getattr(eval_model_module, args.e_name)(args).to(self.rank)
+                    self.eval_copy = getattr(eval_model_module, args.e_name)(args).to(self.rank) 
+                else:
+                    self.eval_model = getattr(eval_model_module, args.e_name)(args)
+                    self.eval_copy = getattr(eval_model_module, args.e_name)(args).to(self.rank)
+                other_tools.load_checkpoints(self.eval_copy, args.data_path+args.e_path, args.e_name)
+                other_tools.load_checkpoints(self.eval_model, args.data_path+args.e_path, args.e_name)
+                if self.args.ddp:
+                    self.eval_model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(self.eval_model, process_group)   
+                    self.eval_model = DDP(self.eval_model, device_ids=[self.rank], output_device=self.rank,
+                                          broadcast_buffers=False, find_unused_parameters=False)
+                self.eval_model.eval()
+                self.eval_copy.eval()
+                if self.rank == 0:
+                    logger.info(f"init {args.e_name} success")  
+            except Exception as e:
+                logger.warning(f"eval_model load failed: {e}, FID evaluation will be skipped")
+                self.eval_model = None
+                self.eval_copy = None
+        
+        self.smplx = None
+        self.alignmenter = None
         self.align_mask = 60
         self.l1_calculator = metric.L1div() if self.rank == 0 else None
        

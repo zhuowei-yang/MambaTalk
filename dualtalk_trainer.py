@@ -93,25 +93,29 @@ class CustomTrainer(train.BaseTrainer):
         return original_shape_t
     
     def _load_data(self, dict_data):
-        # MHR cached pose: body(130) + hand(108) + face(75) + global(10) = 323
-        tar_pose_raw = dict_data["pose"].to(self.rank)
-        in_audio = dict_data["audio"].to(self.rank) 
-        in_word = dict_data["word"].to(self.rank)
-        tar_beta = dict_data["beta"].to(self.rank)
-        tar_id = dict_data["id"].to(self.rank).long().clamp(0, 24)
+        # Speaker1 = condition, Speaker2 = target
+        cond_pose = dict_data["pose1"].to(self.rank)
+        cond_audio = dict_data["audio1"].to(self.rank)
+        cond_word = dict_data["word1"].to(self.rank)
+
+        tar_pose_raw = dict_data["pose2"].to(self.rank)
+        in_audio = dict_data["audio2"].to(self.rank)
+        in_word = dict_data["word2"].to(self.rank)
+        tar_beta = dict_data["beta2"].to(self.rank)
+        tar_id = dict_data["id2"].to(self.rank).long().clamp(0, 24)
         bs, n, _ = tar_pose_raw.shape
 
-        # Direct slicing — no rotation conversion needed
+        # Direct slicing on speaker2 (target)
         tar_pose_body = tar_pose_raw[:, :, MHR_BODY_SLICE[0]:MHR_BODY_SLICE[1]]    # (bs, n, 130)
         tar_pose_hands = tar_pose_raw[:, :, MHR_HAND_SLICE[0]:MHR_HAND_SLICE[1]]   # (bs, n, 108)
         tar_pose_face = tar_pose_raw[:, :, MHR_FACE_SLICE[0]:MHR_FACE_SLICE[1]]    # (bs, n, 75)
         tar_pose_global = tar_pose_raw[:, :, MHR_GLOBAL_SLICE[0]:MHR_GLOBAL_SLICE[1]]  # (bs, n, 7)
         
-        tar_trans = dict_data["trans"].to(self.rank)  # cam_t from data (sequence-level constant)
+        tar_trans = dict_data["trans2"].to(self.rank)
         tar_exps = tar_pose_face[:, :, :72]     # expr_params
-        tar_contact = tar_pose_global[:, :, 3:]  # contact(4), now at index 3 since cam_t removed
+        tar_contact = tar_pose_global[:, :, 3:]  # contact(4)
 
-        # VQ-VAE encoding (frozen)
+        # VQ-VAE encoding on speaker2's pose (frozen)
         tar_index_face = self.vq_model_face.map2index(tar_pose_face)
         tar_index_body = self.vq_model_body.map2index(tar_pose_body)
         tar_index_hands = self.vq_model_hands.map2index(tar_pose_hands)
@@ -120,14 +124,14 @@ class CustomTrainer(train.BaseTrainer):
         latent_body = self.vq_model_body.map2latent(tar_pose_body)
         latent_hands = self.vq_model_hands.map2latent(tar_pose_hands)
         
-        # Global: raw 10d directly (no AE)
+        # Global: raw 7d directly (no AE)
         latent_global = tar_pose_global
 
         latent_in = torch.cat([latent_body, latent_hands, latent_global], dim=2)
         index_in = torch.stack([tar_index_body, tar_index_hands], dim=-1).long()
         
         # Full pose for motion input to the model
-        latent_all = tar_pose_raw  # (bs, n, 323) — MHR native params directly
+        latent_all = tar_pose_raw
         
         return {
             "tar_pose_face": tar_pose_face,
@@ -152,6 +156,9 @@ class CustomTrainer(train.BaseTrainer):
             "tar_id": tar_id,
             "latent_all": latent_all,
             "tar_contact": tar_contact,
+            "cond_pose": cond_pose,
+            "cond_audio": cond_audio,
+            "cond_word": cond_word,
         }
     
     def _g_training(self, loaded_data, use_adv, mode="train", epoch=0):
@@ -163,6 +170,7 @@ class CustomTrainer(train.BaseTrainer):
         net_out_val = self.model(
             loaded_data['in_audio'], loaded_data['in_word'], mask=mask_val,
             in_id=loaded_data['tar_id'], in_motion=loaded_data['latent_all'],
+            cond_audio=loaded_data['cond_audio'], cond_motion=loaded_data['cond_pose'],
             use_attentions=True)
         g_loss_final = 0
         loss_latent_face = self.reclatent_loss(net_out_val["rec_face"], loaded_data["latent_face"])
@@ -224,6 +232,7 @@ class CustomTrainer(train.BaseTrainer):
             net_out_self = self.model(
                 loaded_data['in_audio'], loaded_data['in_word'], mask=mask,
                 in_id=loaded_data['tar_id'], in_motion=loaded_data['latent_all'],
+                cond_audio=loaded_data['cond_audio'], cond_motion=loaded_data['cond_pose'],
                 use_attentions=True, use_word=False)
             
             loss_latent_face_self = self.reclatent_loss(net_out_self["rec_face"], loaded_data["latent_face"])
@@ -244,6 +253,7 @@ class CustomTrainer(train.BaseTrainer):
             net_out_word = self.model(
                 loaded_data['in_audio'], loaded_data['in_word'], mask=mask,
                 in_id=loaded_data['tar_id'], in_motion=loaded_data['latent_all'],
+                cond_audio=loaded_data['cond_audio'], cond_motion=loaded_data['cond_pose'],
                 use_attentions=True, use_word=True)
             
             loss_latent_face_word = self.reclatent_loss(net_out_word["rec_face"], loaded_data["latent_face"])
@@ -311,6 +321,8 @@ class CustomTrainer(train.BaseTrainer):
         tar_contact = loaded_data["tar_contact"]
         in_audio = loaded_data["in_audio"]
         tar_trans = loaded_data["tar_trans"]
+        cond_audio = loaded_data["cond_audio"]
+        cond_motion = loaded_data["cond_pose"]
 
         remain = n % 8
         if remain != 0:
@@ -320,7 +332,13 @@ class CustomTrainer(train.BaseTrainer):
             in_word = in_word[:, :-remain]
             tar_exps = tar_exps[:, :-remain, :]
             tar_contact = tar_contact[:, :-remain, :]
+            cond_motion = cond_motion[:, :-remain, :]
             n = n - remain
+
+        if remain != 0:
+            audio_remain = remain * (16000 // 30)
+            in_audio = in_audio[:, :-audio_remain]
+            cond_audio = cond_audio[:, :-audio_remain]
 
         # MHR direct slicing
         tar_pose_body = tar_pose[:, :, MHR_BODY_SLICE[0]:MHR_BODY_SLICE[1]]
@@ -349,9 +367,14 @@ class CustomTrainer(train.BaseTrainer):
                 latent_all_tmp = latent_all[:, i*(round_l):(i+1)*(round_l)+self.args.pre_frames, :].clone()
                 latent_all_tmp[:, :self.args.pre_frames, :] = latent_last[:, -self.args.pre_frames:, :]
             
+            cond_audio_tmp = cond_audio[:, i*(16000//30*round_l):(i+1)*(16000//30*round_l)+16000//30*self.args.pre_frames]
+            cond_motion_tmp = cond_motion[:, i*(round_l):(i+1)*(round_l)+self.args.pre_frames, :]
+
             net_out_val = self.model(
                 in_audio=in_audio_tmp, in_word=in_word_tmp, mask=mask_val,
-                in_motion=latent_all_tmp, in_id=in_id_tmp, use_attentions=True)
+                in_motion=latent_all_tmp, in_id=in_id_tmp,
+                cond_audio=cond_audio_tmp, cond_motion=cond_motion_tmp,
+                use_attentions=True)
             
             # Body VQ-VAE decoding
             if self.args.cu != 0:
@@ -404,11 +427,11 @@ class CustomTrainer(train.BaseTrainer):
         rec_global = rec_latent_global  # Raw prediction, no decoder
 
         # Reconstruct MHR native params: body(130) + hand(108) + face(75) + global(10)
-        rec_pose = torch.cat([rec_body, rec_hands, rec_face, rec_global], dim=-1)  # (bs, n, 323)
+        rec_pose = torch.cat([rec_body, rec_hands, rec_face, rec_global], dim=-1)
         n = rec_pose.shape[1]
 
         rec_exps = rec_face[:, :, :72]  # expr_params
-        rec_trans = tar_trans[:, :n, :]  # cam_t from original data (not predicted)
+        rec_trans = tar_trans[:, :n, :]
         tar_pose = tar_pose[:, :n, :]
         tar_exps = tar_exps[:, :n, :]
         tar_trans = tar_trans[:, :n, :]
@@ -426,10 +449,8 @@ class CustomTrainer(train.BaseTrainer):
     
 
     def train(self, epoch):
-        #torch.autograd.set_detect_anomaly(True)
         use_adv = bool(epoch>=self.args.no_adv_epoch)
         self.model.train()
-        # self.d_model.train()
         t_start = time.time()
         self.tracker.reset()
         for its, batch_data in enumerate(self.train_loader):
@@ -439,7 +460,6 @@ class CustomTrainer(train.BaseTrainer):
             self.opt.zero_grad()
             g_loss_final = 0
             g_loss_final += self._g_training(loaded_data, use_adv, 'train', epoch)
-            #with torch.autograd.detect_anomaly():
             g_loss_final.backward()
             if self.args.grad_norm != 0: 
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.grad_norm)
@@ -447,7 +467,6 @@ class CustomTrainer(train.BaseTrainer):
             
             mem_cost = torch.cuda.memory_cached() / 1E9
             lr_g = self.opt.param_groups[0]['lr']
-            # lr_d = self.opt_d.param_groups[0]['lr']
             t_train = time.time() - t_start - t_data
             t_start = time.time()
             if its % self.args.log_period == 0:
@@ -455,7 +474,6 @@ class CustomTrainer(train.BaseTrainer):
             if self.args.debug:
                 if its == 1: break
         self.opt_s.step(epoch)
-        # self.opt_d_s.step(epoch) 
     
     def val(self, epoch):
         self.model.eval()
@@ -517,11 +535,13 @@ class CustomTrainer(train.BaseTrainer):
                     latent_out.append(self.eval_copy.map2latent(rec_pose[:, :n-remain]).reshape(-1, self.args.vae_length).detach().cpu().numpy())
                     latent_ori.append(self.eval_copy.map2latent(tar_pose[:, :n-remain]).reshape(-1, self.args.vae_length).detach().cpu().numpy())
 
-                # Save MHR native format npz
                 rec_np = rec_pose.detach().cpu().numpy().reshape(bs*n, -1)
                 tar_np = tar_pose.detach().cpu().numpy().reshape(bs*n, -1)
                 
-                gt_npz = np.load(self.args.data_path+self.args.pose_rep+"/"+test_seq_list.iloc[its]['id']+".npz", allow_pickle=True)
+                speaker1_id = test_seq_list.iloc[its]['id']
+                speaker2_id = speaker1_id.rsplit("speaker1", 1)[0] + "speaker2" + speaker1_id.rsplit("speaker1", 1)[1]
+
+                gt_npz = np.load(self.args.data_path+self.args.pose_rep+"/"+speaker2_id+".npz", allow_pickle=True)
                 shape = gt_npz['shape_params'] if 'shape_params' in gt_npz.files else np.zeros(45, dtype=np.float32)
                 scale_params = gt_npz['scale_params'][0] if 'scale_params' in gt_npz.files else np.zeros(28, dtype=np.float32)
                 focal_length = float(gt_npz['focal_length'][0]) if 'focal_length' in gt_npz.files else 1500.0
@@ -531,11 +551,10 @@ class CustomTrainer(train.BaseTrainer):
                     focal_length=np.array([focal_length]), width=np.array([orig_width]),
                     height=np.array([orig_height]), mocap_frame_rate=30)
                 
-                # cam_t: sequence-level constant from original data
                 cam_t_seq = net_out['tar_trans'].detach().cpu().numpy().reshape(bs*n, -1)
                 cam_t_mean = cam_t_seq.mean(axis=0, keepdims=True).repeat(bs*n, axis=0)
                 
-                np.savez(results_save_path+"gt_"+test_seq_list.iloc[its]['id']+'.npz',
+                np.savez(results_save_path+"gt_"+speaker2_id+'.npz',
                     body_pose_params=np.concatenate([tar_np[:, MHR_BODY_SLICE[0]:MHR_BODY_SLICE[1]], tar_np[:, MHR_FACE_SLICE[0]+72:MHR_FACE_SLICE[1]]], axis=1),
                     hand_pose_params=tar_np[:, MHR_HAND_SLICE[0]:MHR_HAND_SLICE[1]],
                     expr_params=tar_np[:, MHR_FACE_SLICE[0]:MHR_FACE_SLICE[0]+72],
@@ -543,7 +562,7 @@ class CustomTrainer(train.BaseTrainer):
                     pred_cam_t=cam_t_seq,
                     **render_consts,
                 )
-                np.savez(results_save_path+"res_"+test_seq_list.iloc[its]['id']+'.npz',
+                np.savez(results_save_path+"res_"+speaker2_id+'.npz',
                     body_pose_params=np.concatenate([rec_np[:, MHR_BODY_SLICE[0]:MHR_BODY_SLICE[1]], rec_np[:, MHR_FACE_SLICE[0]+72:MHR_FACE_SLICE[1]]], axis=1),
                     hand_pose_params=rec_np[:, MHR_HAND_SLICE[0]:MHR_HAND_SLICE[1]],
                     expr_params=rec_np[:, MHR_FACE_SLICE[0]:MHR_FACE_SLICE[0]+72],
@@ -583,7 +602,11 @@ class CustomTrainer(train.BaseTrainer):
                 bs, n = rec_pose.shape[0], rec_pose.shape[1]
 
                 rec_np = rec_pose.detach().cpu().numpy().reshape(bs*n, -1)
-                gt_npz = np.load(self.args.data_path+self.args.pose_rep+"/"+test_seq_list.iloc[its]['id']+".npz", allow_pickle=True)
+
+                speaker1_id = test_seq_list.iloc[its]['id']
+                speaker2_id = speaker1_id.rsplit("speaker1", 1)[0] + "speaker2" + speaker1_id.rsplit("speaker1", 1)[1]
+
+                gt_npz = np.load(self.args.data_path+self.args.pose_rep+"/"+speaker2_id+".npz", allow_pickle=True)
                 shape = gt_npz['shape_params'] if 'shape_params' in gt_npz.files else np.zeros(45, dtype=np.float32)
                 scale_params = gt_npz['scale_params'][0] if 'scale_params' in gt_npz.files else np.zeros(28, dtype=np.float32)
                 focal_length = float(gt_npz['focal_length'][0]) if 'focal_length' in gt_npz.files else 1500.0
@@ -593,7 +616,7 @@ class CustomTrainer(train.BaseTrainer):
                 cam_t_demo = net_out['tar_trans'].detach().cpu().numpy().reshape(bs*n, -1)
                 cam_t_demo_mean = cam_t_demo.mean(axis=0, keepdims=True).repeat(bs*n, axis=0)
                 
-                np.savez(results_save_path+"res_"+test_seq_list.iloc[its]['id']+'.npz',
+                np.savez(results_save_path+"res_"+speaker2_id+'.npz',
                     body_pose_params=np.concatenate([rec_np[:, MHR_BODY_SLICE[0]:MHR_BODY_SLICE[1]], rec_np[:, MHR_FACE_SLICE[0]+72:MHR_FACE_SLICE[1]]], axis=1),
                     hand_pose_params=rec_np[:, MHR_HAND_SLICE[0]:MHR_HAND_SLICE[1]],
                     expr_params=rec_np[:, MHR_FACE_SLICE[0]:MHR_FACE_SLICE[0]+72],

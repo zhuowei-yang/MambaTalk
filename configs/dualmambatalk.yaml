@@ -8,7 +8,7 @@ data_path: ./data/
 e_path: weights/AESKConv_240_100.bin
 eval_model: motion_representation
 e_name: null
-test_ckpt: ./outputs/audio2pose/custom/0225_014119_mambatalk/last_70.bin
+test_ckpt: null
 data_path_1: ./pretrained/
 vae_test_len: 32
 vae_test_dim: 320
@@ -22,9 +22,9 @@ variational: False
 # data config
 training_speakers: [1]
 additional_data: False
-cache_path: datasets/beat_cache/mhr_mambatalk/
-dataset: beat_sep_lower
-new_cache: False
+cache_path: datasets/beat_cache/mhr_dualmambatalk/
+dataset: beat_dual
+new_cache: True
 
 # motion config (MHR native)
 ori_joints: beat_smplx_joints
@@ -34,8 +34,6 @@ pose_norm: False
 pose_fps: 30
 rot6d: False
 pre_frames: 4
-# pose_dims = body(130) + hand(108) + face(75) + global(7) = 320
-# global = global_rot(3) + contact(4); cam_t is sequence-level constant
 pose_dims: 320
 pose_length: 64
 stride: 20
@@ -84,9 +82,9 @@ speaker_f: 0
 # model config
 batch_size: 64
 lr_base: 2e-4
-model: mambatalk
-g_name: MambaTalk
-trainer: mambatalk
+model: dualmambatalk
+g_name: DualMambaTalk
+trainer: dualtalk
 hidden_size: 768
 n_layer: 1
 
@@ -109,5 +107,5 @@ vel_hands_weight: 1.0
 acc_body_weight: 1.0
 acc_global_weight: 1.0
 acc_hands_weight: 0.5
-pose_body_weight: 1.0
-pose_vel_body_weight: 1.0
+pose_body_weight: 0.0
+pose_vel_body_weight: 0.0

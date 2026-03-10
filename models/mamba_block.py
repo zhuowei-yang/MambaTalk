@@ -46,14 +46,12 @@ def create_block(
         attn_cfg = {}
     factory_kwargs = {"device": device, "dtype": dtype}
     if layer_idx not in attn_layer_idx:
-        # Create a copy of the config to modify
         ssm_cfg = copy.deepcopy(ssm_cfg) if ssm_cfg is not None else {}
         ssm_layer = ssm_cfg.pop("layer", "Mamba1")
         if ssm_layer not in ["Mamba1", "Mamba2"]:
             raise ValueError(f"Invalid ssm_layer: {ssm_layer}, only support Mamba1 and Mamba2")
         mixer_cls = partial(
             Mamba2 if ssm_layer == "Mamba2" else Mamba,
-            # Mamba2,
             layer_idx=layer_idx,
             **ssm_cfg,
             **factory_kwargs
