@@ -2,6 +2,17 @@
 BEAT2
 datasets
 pretrained
+data/
+data_new/
+data
+data_new
+outputs/
+ckp/
+checkpoints/
+*.ckp
+*.ckpt
+*.pth
+*.pt
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

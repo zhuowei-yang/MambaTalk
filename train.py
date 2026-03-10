@@ -103,7 +103,7 @@ class BaseTrainer(object):
             self.opt_d = create_optimizer(args, self.d_model, lr_weight=args.d_lr_weight)
             self.opt_d_s = create_scheduler(args, self.opt_d)
            
-        if args.e_name is not None:
+        if args.e_name is not None and args.e_name != 'null':
             """
             bugs on DDP training using eval_model, using additional eval_copy for evaluation 
             """
@@ -131,17 +131,24 @@ class BaseTrainer(object):
                     wandb.watch(self.eval_model) 
         self.opt = create_optimizer(args, self.model)
         self.opt_s = create_scheduler(args, self.opt)
-        self.smplx = smplx.create(
-            self.args.data_path_1+"smplx_models/", 
-            model_type='smplx',
-            gender='NEUTRAL_2020', 
-            use_face_contour=False,
-            num_betas=300,
-            num_expression_coeffs=100, 
-            ext='npz',
-            use_pca=False,
-        ).to(self.rank).eval()
-        self.alignmenter = metric.alignment(0.3, 7, self.train_data.avg_vel, upper_body=[3,6,9,12,13,14,15,16,17,18,19,20,21]) if self.rank == 0 else None
+        try:
+            self.smplx = smplx.create(
+                self.args.data_path_1+"smplx_models/", 
+                model_type='smplx',
+                gender='NEUTRAL_2020', 
+                use_face_contour=False,
+                num_betas=300,
+                num_expression_coeffs=100, 
+                ext='npz',
+                use_pca=False,
+            ).to(self.rank).eval()
+        except Exception as e:
+            logger.warning(f"smplx model not available: {e}, skipping")
+            self.smplx = None
+        try:
+            self.alignmenter = metric.alignment(0.3, 7, self.train_data.avg_vel, upper_body=[3,6,9,12,13,14,15,16,17,18,19,20,21]) if self.rank == 0 else None
+        except Exception:
+            self.alignmenter = None
         self.align_mask = 60
         self.l1_calculator = metric.L1div() if self.rank == 0 else None
        
