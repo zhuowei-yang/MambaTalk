@@ -33,6 +33,8 @@ class CustomTrainer(train.BaseTrainer):
         super().__init__(args)
         self.args = args
         self.joints = 55
+        if not hasattr(self, 'eval_copy'):
+            self.eval_copy = None
 
         self.tracker = other_tools.EpochTracker(
             ["fid", "l1div", "bc", "rec", "trans", "vel", "transv", 'dis', 'gen', 'acc',
@@ -403,7 +405,14 @@ class CustomTrainer(train.BaseTrainer):
         rec_face = self.vq_model_face.decode(rec_index_face) if self.args.cf != 0 else self.vq_model_face.decoder(rec_index_face)
         rec_global = rec_latent_global  # Raw prediction, no decoder
 
-        # Reconstruct MHR native params: body(130) + hand(108) + face(75) + global(10)
+        # Savgol filter to smooth global across clip boundaries
+        from scipy.signal import savgol_filter
+        rec_global_np = rec_global.detach().cpu().numpy()
+        for b in range(rec_global_np.shape[0]):
+            rec_global_np[b] = savgol_filter(rec_global_np[b], window_length=5, polyorder=2, axis=0)
+        rec_global = torch.from_numpy(rec_global_np).to(rec_latent_global.device)
+
+        # Reconstruct MHR native params: body(130) + hand(108) + face(75) + global(7)
         rec_pose = torch.cat([rec_body, rec_hands, rec_face, rec_global], dim=-1)  # (bs, n, 323)
         n = rec_pose.shape[1]
 
