@@ -1,0 +1,28 @@
+# FreqPD (FMLP + PD) composite module pre-training config
+# Same data pipeline as pd_config.yaml but trains FreqPeriodicBlock
+
+# --- Training ---
+epochs: 200
+batch_size: 256
+lr: 0.0005
+weight_decay: 0.0
+grad_norm: 1.0
+save_period: 20
+log_period: 10
+
+# --- FreqPD Module ---
+pd_input_dim: 153    # 51 joints x 3
+pd_n_channels: 10    # number of periodic channels (N)
+pd_lambda_vel: 0.5   # velocity loss weight
+max_T: 128           # max sequence length for filter initialization
+dropout: 0.1         # dropout rate for filter layer
+
+# --- Data ---
+data_path: ./data_new/
+pose_rep: smplxflame_30
+pose_fps: 30
+pose_length: 64
+stride: 20
+
+# --- Output ---
+out_dir: ./outputs/freq_pd_pretrain/

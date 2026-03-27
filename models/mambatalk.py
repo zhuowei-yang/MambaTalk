@@ -1,0 +1,321 @@
+import copy
+import math
+import pickle
+import torch
+import torch.nn as nn
+from loguru import logger
+
+from .motion_encoder import * 
+from .layers import *
+from .mamba_block import MambaModel, MambaScan
+
+
+class PeriodicPredictor(nn.Module):
+    """
+    Predicts periodic parameters (A, F, B, S) from multi-modal features
+    using LSTM + Weight-Blended Mixture-of-Experts (from HIP / Local Motion Phases).
+    """
+
+    def __init__(self, input_dim=768, hidden_dim=256, n_channels=10, n_experts=4):
+        super().__init__()
+        self.n_channels = n_channels
+        self.n_experts = n_experts
+
+        self.lstm = nn.LSTM(input_dim, hidden_dim, num_layers=1, batch_first=True)
+
+        self.gate = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim), nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim), nn.ReLU(),
+            nn.Linear(hidden_dim, n_experts), nn.Softmax(dim=-1),
+        )
+
+        self.experts = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(hidden_dim, hidden_dim), nn.ReLU(),
+                nn.Linear(hidden_dim, hidden_dim), nn.ReLU(),
+                nn.Linear(hidden_dim, n_channels * 3),  # A, F, B
+            ) for _ in range(n_experts)
+        ])
+
+        self.fc_phase = nn.Linear(hidden_dim, n_channels * 2)  # (sx, sy) for S
+
+    def forward(self, x):
+        """
+        x: (B, T, input_dim) – multi-modal features (e.g. global_motions)
+        Returns dict {A, F, B, S} each (B, N), and periodic_signal (B, T, N)
+        """
+        B, T, _ = x.shape
+        h, _ = self.lstm(x)  # (B, T, hidden_dim)
+
+        gate_weights = self.gate(h)  # (B, T, n_experts)
+        expert_outs = torch.stack([e(h) for e in self.experts], dim=-1)  # (B, T, N*3, n_experts)
+        blended = (expert_outs * gate_weights.unsqueeze(2)).sum(dim=-1)  # (B, T, N*3)
+
+        h_mid = h[:, T // 2, :]  # (B, hidden_dim) — use center frame as representative
+        afb_mid = blended[:, T // 2, :]  # (B, N*3)
+        A = afb_mid[:, :self.n_channels].abs()
+        F_val = afb_mid[:, self.n_channels:2*self.n_channels].sigmoid() * 0.5
+        B_val = afb_mid[:, 2*self.n_channels:]
+
+        sx_sy = self.fc_phase(h_mid).view(B, self.n_channels, 2)
+        S = torch.atan2(sx_sy[..., 1], sx_sy[..., 0])
+
+        t_axis = torch.arange(T, device=x.device, dtype=x.dtype).unsqueeze(0).unsqueeze(-1)
+        periodic_signal = (
+            A.unsqueeze(1) *
+            torch.sin(2 * math.pi * (F_val.unsqueeze(1) * t_axis - S.unsqueeze(1)))
+            + B_val.unsqueeze(1)
+        )  # (B, T, N)
+
+        return {
+            "A": A, "F": F_val, "B": B_val, "S": S,
+            "periodic_signal": periodic_signal,
+        }
+
+
+class PeriodicMapper(nn.Module):
+    """Maps N-channel periodic signal to body (260d) + hand (108d) motion space."""
+
+    def __init__(self, n_channels=10, body_dim=260, hand_dim=108):
+        super().__init__()
+        self.body_map = nn.Sequential(
+            nn.Conv1d(n_channels, 64, kernel_size=3, padding=1),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv1d(64, body_dim, kernel_size=3, padding=1),
+        )
+        self.hand_map = nn.Sequential(
+            nn.Conv1d(n_channels, 64, kernel_size=3, padding=1),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv1d(64, hand_dim, kernel_size=3, padding=1),
+        )
+
+    def forward(self, periodic_signal):
+        """periodic_signal: (B, T, N) -> body_pe (B, T, 260), hand_pe (B, T, 108)"""
+        x = periodic_signal.transpose(1, 2)
+        body_pe = self.body_map(x).transpose(1, 2)
+        hand_pe = self.hand_map(x).transpose(1, 2)
+        return body_pe, hand_pe
+
+
+class GlobalScan(nn.Module):
+    def __init__(self, args):
+        super(GlobalScan, self).__init__()
+        self.args = args
+        args_top = copy.deepcopy(self.args)
+        args_top.vae_layer = 3
+        args_top.vae_length = args.motion_f
+        args_top.vae_test_dim = args.pose_dims
+        self.learnable_query = nn.Parameter(torch.zeros(1, 1, self.args.pose_dims))
+        self.motion_encoder = VQEncoderV6(args_top)
+        self.motion_proj1 = MLP(args.motion_f, args.hidden_size, args.motion_f)
+        self.motion_proj2 = nn.Linear(args.motion_f, args.hidden_size)
+
+        # self-attention
+        self.position_embeddings = PeriodicPositionalEncoding(args.hidden_size, period=args.pose_length, max_seq_len=args.pose_length)
+        self.face_q_self_attn = nn.TransformerEncoder(nn.TransformerEncoderLayer(d_model=args.hidden_size, nhead=4, dim_feedforward=args.hidden_size, batch_first=True), num_layers=1)
+        self.body_q_self_attn = nn.TransformerEncoder(nn.TransformerEncoderLayer(d_model=args.hidden_size, nhead=4, dim_feedforward=args.hidden_size, batch_first=True), num_layers=1)
+        self.motion_self_encoder = nn.TransformerEncoder(nn.TransformerEncoderLayer(d_model=args.hidden_size, nhead=4, dim_feedforward=args.hidden_size, batch_first=True), num_layers=1)
+        
+        # scan
+        self.face_scan = MambaScan(in_dim=args.audio_f, d_intermediate=args.audio_f * 2, out_dim=args.audio_f, n_layer=1)
+        self.body_scan = MambaScan(in_dim=args.motion_f, d_intermediate=args.hidden_size, out_dim=args.motion_f, n_layer=1)        
+        self.out = nn.Linear(args.audio_f + args.motion_f, args.hidden_size)
+
+    def forward(self, in_motion, mask, speaker_embedding_face, speaker_embedding_body, face_features):
+        # learnable query
+        learnable_query = self.learnable_query.expand_as(in_motion)
+        learnable_query = torch.where(mask == 1, learnable_query, in_motion)
+        body_features = self.motion_encoder(learnable_query)
+        motion_features = self.motion_proj2(self.motion_proj1(body_features))
+        
+        # self-attention
+        speaker_embedding_face = self.face_q_self_attn(speaker_embedding_face)
+        speaker_embedding_body = self.body_q_self_attn(speaker_embedding_body)
+        motion_features = speaker_embedding_body + motion_features
+        motion_features = self.position_embeddings(motion_features)
+        global_motion = self.motion_self_encoder(motion_features)         
+        
+        # scan
+        face_features = self.face_scan(face_features)
+        body_features = self.body_scan(body_features)
+        global_features = self.out(torch.cat([face_features, body_features], dim=2))
+        
+        return global_motion, global_features
+
+
+class LocalScan(nn.Module):
+    def __init__(self, args):
+        super(LocalScan, self).__init__()
+        self.args = args
+
+        # cross-attention
+        self.position_embeddings = PeriodicPositionalEncoding(args.hidden_size, period=args.pose_length, max_seq_len=args.pose_length)
+        self.motion_cross_attn = nn.TransformerDecoder(nn.TransformerDecoderLayer(d_model=args.hidden_size, nhead=4, dim_feedforward=args.hidden_size, batch_first=True), num_layers=8)
+        self.motion2latent_body = MLP(args.hidden_size, args.hidden_size, args.hidden_size)
+        self.motion2latent_hands = MLP(args.hidden_size, args.hidden_size, args.hidden_size)
+        self.motion2latent_global = MLP(args.hidden_size, args.hidden_size, args.hidden_size)
+        self.face_proj = nn.Linear(2*args.hidden_size, args.hidden_size)
+        self.body_scan_proj = nn.Linear(2*args.hidden_size, args.hidden_size)
+        self.hands_proj = nn.Linear(2*args.hidden_size, args.hidden_size)
+        self.global_proj = nn.Linear(2*args.hidden_size, args.hidden_size)
+        self.body_audio_proj = nn.Linear(args.audio_f, args.hidden_size)
+
+        # scan
+        self.face_scan = MambaScan(in_dim=args.hidden_size, d_intermediate=args.hidden_size, out_dim=args.hidden_size, n_layer=4)
+        self.body_scan = MambaModel(d_model=args.hidden_size, n_layer=1, d_intermediate=args.hidden_size)
+        self.hands_scan = MambaModel(d_model=args.hidden_size, n_layer=1, d_intermediate=args.hidden_size)
+        self.global_scan = MambaModel(d_model=args.hidden_size, n_layer=1, d_intermediate=args.hidden_size)
+
+        # decoder
+        self.motion_down_face = nn.Linear(args.hidden_size, args.vae_codebook_size)
+        self.motion_down_body = nn.Linear(args.hidden_size, args.vae_codebook_size)
+        self.motion_down_hands = nn.Linear(args.hidden_size, args.vae_codebook_size)
+        self.motion_down_global = nn.Linear(args.hidden_size, args.global_dims)  # raw 10d output
+        self.face_classifier = MLP(args.vae_codebook_size, args.hidden_size, args.vae_codebook_size)
+        self.body_classifier = MLP(args.vae_codebook_size, args.hidden_size, args.vae_codebook_size)
+        self.hands_classifier = MLP(args.vae_codebook_size, args.hidden_size, args.vae_codebook_size)
+
+    def forward(self, global_motions, global_features, face_latent_in, speaker_embedding_body, body_features, use_word):
+        # cross attn
+        motion_refined_embeddings_in = global_motions + speaker_embedding_body
+        motion_refined_embeddings_in = self.position_embeddings(global_motions)        
+        learnable_querys = self.motion_cross_attn(tgt=motion_refined_embeddings_in, memory=self.body_audio_proj(body_features))
+        global_motions = global_motions + learnable_querys
+        
+        # feedforward
+        body_latent = self.motion2latent_body(global_motions)
+        hands_latent = self.motion2latent_hands(global_motions)
+        global_latent = self.motion2latent_global(global_motions)
+        
+        body_latent_in = body_latent + speaker_embedding_body
+        hands_latent_in = hands_latent + speaker_embedding_body
+        global_latent_in = global_latent + speaker_embedding_body
+        
+        body_latent_in = self.position_embeddings(body_latent_in)
+        hands_latent_in = self.position_embeddings(hands_latent_in)
+        global_latent_in = self.position_embeddings(global_latent_in)
+        face_latent_in = self.position_embeddings(face_latent_in)        
+        
+        # local scan
+        decoded_face = self.face_scan(self.face_proj(torch.cat([face_latent_in, global_features], dim=-1)))          
+        motion_body = self.body_scan(self.body_scan_proj(torch.cat([body_latent_in, hands_latent+global_latent], dim=-1)))
+        motion_hands = self.hands_scan(self.hands_proj(torch.cat([hands_latent_in, body_latent+global_latent], dim=-1)))
+        motion_global = self.global_scan(self.global_proj(torch.cat([global_latent_in, body_latent+hands_latent], dim=-1)))
+        
+        # codebook
+        face_latent = self.motion_down_face(decoded_face)
+        body_latent = self.motion_down_body(motion_body+body_latent)
+        hands_latent = self.motion_down_hands(motion_hands+hands_latent)
+        global_latent = self.motion_down_global(motion_global+global_latent)
+
+        cls_face = self.face_classifier(face_latent)
+        cls_body = self.body_classifier(body_latent)
+        cls_hands = self.hands_classifier(hands_latent)
+
+        return {
+            "rec_face": face_latent,
+            "rec_body": body_latent,
+            "rec_hands": hands_latent,
+            "rec_global": global_latent,  # raw 10d, no codebook
+            "cls_face": cls_face,
+            "cls_body": cls_body,
+            "cls_hands": cls_hands,
+        }
+
+
+class MambaTalk(nn.Module):
+    def __init__(self, args):
+        super().__init__()
+        self.args = args   
+        with open(f"{args.data_path}weights/vocab.pkl", 'rb') as f:
+            self.lang_model = pickle.load(f)
+            pre_trained_embedding = self.lang_model.word_embedding_weights
+        self.text_pre_encoder_face = nn.Embedding.from_pretrained(torch.FloatTensor(pre_trained_embedding), freeze=args.t_fix_pre)
+        self.text_encoder_face = nn.Linear(300, args.audio_f) 
+        self.text_pre_encoder_body = nn.Embedding.from_pretrained(torch.FloatTensor(pre_trained_embedding), freeze=args.t_fix_pre)
+        self.text_encoder_body = nn.Linear(300, args.audio_f) 
+
+        # audio/text fusion
+        self.audio_pre_encoder_face = WavEncoder(args.audio_f, audio_in=3)
+        self.audio_pre_encoder_body = WavEncoder(args.audio_f, audio_in=2)        
+        self.at_attn_face = nn.Linear(args.audio_f*2, args.audio_f*2)
+        self.at_attn_body = nn.Linear(args.audio_f*2, args.audio_f*2)
+        
+        # mamba scan
+        self.global_scan = GlobalScan(args)
+        self.local_scan = LocalScan(args)
+
+        # id emb
+        self.speaker_encoder_face = nn.Embedding(25, args.hidden_size)
+        self.speaker_encoder_body = nn.Embedding(25, args.hidden_size)
+
+        # periodic enhancement (optional, enabled when pd_n_channels > 0)
+        pd_nc = getattr(args, 'pd_n_channels', 0)
+        self.use_periodic = pd_nc > 0
+        print(f"[MAMBATALK-INIT] pd_n_channels={pd_nc}, use_periodic={self.use_periodic}, id={id(self)}", flush=True)
+        if self.use_periodic:
+            n_ch = args.pd_n_channels
+            self.periodic_predictor = PeriodicPredictor(
+                input_dim=args.hidden_size,
+                hidden_dim=256,
+                n_channels=n_ch,
+                n_experts=4,
+            )
+            self.periodic_mapper = PeriodicMapper(
+                n_channels=n_ch,
+                body_dim=260,
+                hand_dim=108,
+            )
+
+    def forward(self, in_audio=None, in_word=None, mask=None, is_test=None, in_motion=None, use_attentions=True, use_word=True, in_id=None):
+        in_word_face = self.text_pre_encoder_face(in_word)
+        in_word_face = self.text_encoder_face(in_word_face)
+        in_word_body = self.text_pre_encoder_body(in_word)
+        in_word_body = self.text_encoder_body(in_word_body)
+        bs, t, c = in_word_face.shape
+
+        in_audio_face = self.audio_pre_encoder_face(in_audio)
+        in_audio_body = self.audio_pre_encoder_body(in_audio[...,:2])
+        
+        if in_audio_face.shape[1] != in_motion.shape[1]:
+            diff_length = in_motion.shape[1] - in_audio_face.shape[1]
+            if diff_length < 0:
+                in_audio_face = in_audio_face[:, :diff_length, :]
+                in_audio_body = in_audio_body[:, :diff_length, :]
+            else:
+                in_audio_face = torch.cat((in_audio_face, in_audio_face[:,-diff_length:]),1)
+                in_audio_body = torch.cat((in_audio_body, in_audio_body[:,-diff_length:]),1)
+
+        # audio/text fusion
+        alpha_at_face = torch.cat([in_word_face, in_audio_face], dim=-1).reshape(bs, t, c*2)
+        alpha_at_face = self.at_attn_face(alpha_at_face).reshape(bs, t, c, 2)
+        alpha_at_face = alpha_at_face.softmax(dim=-1)
+        fusion_face = in_word_face * alpha_at_face[:,:,:,1] + in_audio_face * alpha_at_face[:,:,:,0]
+        alpha_at_body = torch.cat([in_word_body, in_audio_body], dim=-1).reshape(bs, t, c*2)
+        alpha_at_body = self.at_attn_body(alpha_at_body).reshape(bs, t, c, 2)
+        alpha_at_body = alpha_at_body.softmax(dim=-1)
+        fusion_body = in_word_body * alpha_at_body[:,:,:,1] + in_audio_body * alpha_at_body[:,:,:,0]
+        
+        # ID Emd
+        speaker_embedding_face = self.speaker_encoder_face(in_id).squeeze(2)
+        speaker_embedding_body = self.speaker_encoder_body(in_id).squeeze(2)
+        
+        # Global Scan
+        global_motions, global_features = self.global_scan(in_motion, mask, speaker_embedding_face, speaker_embedding_body, fusion_face)
+        
+        # Local Scan
+        output = self.local_scan(global_motions, global_features, speaker_embedding_face, speaker_embedding_body, fusion_body, use_word)
+
+        # Periodic enhancement branch
+        if not hasattr(self, 'use_periodic'):
+            print("[DEBUG] MambaTalk has no use_periodic attribute!")
+        elif not self.use_periodic:
+            print("[DEBUG] use_periodic is False")
+        if self.use_periodic:
+            pd_out = self.periodic_predictor(global_motions)
+            body_pe, hand_pe = self.periodic_mapper(pd_out["periodic_signal"])
+            output["periodic_params"] = {k: pd_out[k] for k in ("A", "F", "B", "S")}
+            output["periodic_body"] = body_pe
+            output["periodic_hands"] = hand_pe
+
+        return output

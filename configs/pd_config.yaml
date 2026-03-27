@@ -1,0 +1,38 @@
+# Periodicity Disentanglement (PD) module pre-training config
+# Based on HIP paper: 200 epochs, batch_size=256, lr=5e-4, N=10 channels
+
+# --- Training ---
+epochs: 200
+batch_size: 256
+lr: 0.0005
+weight_decay: 0.0
+grad_norm: 1.0
+save_period: 20
+log_period: 10
+
+# --- PD Module ---
+pd_input_dim: 153    # 51 joints × 3
+pd_n_channels: 10    # number of periodic channels (N)
+pd_lambda_vel: 0.5   # velocity loss weight
+
+# --- Data (reuse MambaTalk data paths) ---
+data_path: ./data_new/
+pose_rep: smplxflame_30
+cache_path: datasets/
+pose_fps: 30
+pose_length: 64
+stride: 20
+audio_sr: 16000
+audio_fps: 16000
+audio_rep: "amplitude+ctc+audio"
+word_rep: textgrid
+additional_data: False
+disable_filtering: True
+clean_first_seconds: 0
+clean_final_seconds: 0
+new_cache: True
+multi_length_training: [1.0]
+test_length: 64
+
+# --- Output ---
+out_dir: ./outputs/pd_pretrain/

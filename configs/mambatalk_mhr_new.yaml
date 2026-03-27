@@ -1,0 +1,113 @@
+is_train: True
+ddp: False
+stat: ts
+root_path: ./
+out_path: ./outputs/audio2pose/
+project: mambatalk_mhr_new
+data_path: ./data_new/
+e_path: weights/AESKConv_240_100.bin
+eval_model: motion_representation
+e_name: null
+test_ckpt: ./outputs/audio2pose/custom/0315_180244_mambatalk_mhr_new/last_90.bin
+data_path_1: ./pretrained/
+vae_test_len: 32
+vae_test_dim: 381
+vae_test_stride: 20
+vae_length: 240
+vae_codebook_size: 512
+body_codebook_size: 512
+hand_codebook_size: 256
+vae_layer: 4
+vae_grow: [1,1,2,1]
+variational: False
+
+training_speakers: [1]
+additional_data: False
+cache_path: datasets/beat_cache/mhr_mambatalk_new_datanew/
+dataset: beat_mhr
+new_cache: False
+
+ori_joints: beat_smplx_joints
+tar_joints: beat_smplx_full
+pose_rep: smplxflame_30
+pose_norm: False
+pose_fps: 30
+rot6d: True
+pre_frames: 4
+pose_dims: 381
+pose_length: 64
+stride: 20
+test_length: 64
+motion_f: 256
+m_pre_encoder: null
+m_encoder: null
+m_fix_pre: False
+
+audio_rep: amplitude+ctc+audio
+audio_sr: 16000
+audio_fps: 16000
+audio_norm: False
+audio_f: 512
+
+word_rep: textgrid
+word_index_num: 11195
+word_dims: 300
+freeze_wordembed: False
+word_f: 256
+t_pre_encoder: fasttext
+t_encoder: null
+t_fix_pre: False
+
+facial_rep: null
+facial_dims: 75
+facial_norm: False
+facial_f: 0
+f_pre_encoder: null
+f_encoder: null
+f_fix_pre: False
+
+id_rep: onehot
+speaker_f: 0
+
+batch_size: 64
+lr_base: 2e-4
+model: mambatalk_mhr
+g_name: MambaTalk
+trainer: mambatalk_mhr_new
+hidden_size: 768
+n_layer: 1
+
+hand_dims: 108
+global_dims: 6
+
+rec_weight: 1
+grad_norm: 0.99
+epochs: 150
+test_period: 10
+test_start_epoch: 40
+
+ll: 3
+lf: 0
+lu: 3
+lh: 3
+cl: 0
+cf: 0
+cu: 1
+ch: 1
+
+vel_global_weight: 2.0
+vel_body_weight: 0.5
+vel_hands_weight: 1.0
+acc_body_weight: 1.0
+acc_global_weight: 1.0
+acc_hands_weight: 0.5
+
+beat_align: False
+port: 9508
+
+# --- v8: FMLP-enhanced Periodic Enhancement ---
+pd_n_channels: 10
+pd_checkpoint: ./outputs/freq_pd_pretrain/freq_pd_best.bin
+pd_n_filter_layers: 2
+lambda_p: 0.1
+lambda_motion: 0.1
